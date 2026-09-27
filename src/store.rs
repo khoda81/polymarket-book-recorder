@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
