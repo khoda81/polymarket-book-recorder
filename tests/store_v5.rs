@@ -65,6 +65,31 @@ fn migrates_v5_checkpoint_and_tail_to_canonical_v6() {
         )
         .unwrap();
 
+    let frozen_only_json = r#"{
+      "version":5,
+      "current":[],
+      "field":{
+        "maxPrice":10000,
+        "currentValidThroughMs":null,
+        "runs":[{
+          "price":6000,
+          "volume":0.0,
+          "frozenBands":[
+            {"loVolume":0.0,"hiVolume":7.0,"validThroughMs":1500.0}
+          ]
+        }]
+      }
+    }"#;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(frozen_only_json.as_bytes()).unwrap();
+    let frozen_only_checkpoint = encoder.finish().unwrap();
+    connection
+        .execute(
+            "INSERT INTO token_state(token_id,status,recording_since_ms,pressure) VALUES (?1,'completed',1200,?2)",
+            params!["frozen-only", frozen_only_checkpoint],
+        )
+        .unwrap();
+
     let mutation = encode_v5_update(2_000.0, 5_000, 4.0);
     connection
         .execute(
@@ -102,6 +127,18 @@ fn migrates_v5_checkpoint_and_tail_to_canonical_v6() {
     );
     assert!(json.to_string().find("loVolume").is_none());
     assert!(json.get("current").is_none());
+
+    let historical = store.load("frozen-only").unwrap().unwrap();
+    let historical_snapshot = historical.pressure.unwrap();
+    let historical_json = serde_json::to_value(historical_snapshot).unwrap();
+    assert_eq!(historical_json["version"], 6);
+    assert_eq!(historical_json["state"]["kind"], "observed");
+    assert_eq!(historical_json["state"]["validThroughMs"], 1_500);
+    assert_eq!(historical_json["state"]["runs"][0]["shares"], 0.0);
+    assert_eq!(
+        historical_json["state"]["runs"][0]["frozenSteps"][0]["hiVolume"],
+        7.0
+    );
 
     drop(store);
     let connection = Connection::open(&path).unwrap();
