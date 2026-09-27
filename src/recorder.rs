@@ -53,6 +53,8 @@ pub struct RecorderStats {
     pub hydrated_tokens: usize,
     pub live_books: usize,
     pub subscription_connections: usize,
+    pub connected_subscription_connections: usize,
+    pub assigned_subscription_tokens: usize,
     pub subscription_batches: usize,
     pub dirty_tokens: usize,
     pub pending_pressure_mutations: usize,
@@ -440,6 +442,8 @@ impl AgeRecorder {
             hydrated_tokens: self.memories.len(),
             live_books: self.books.len(),
             subscription_connections: self.subscriptions.active_connection_count(),
+            connected_subscription_connections: self.subscriptions.connected_connection_count(),
+            assigned_subscription_tokens: self.subscriptions.assigned_token_count(),
             subscription_batches: self.subscriptions.active_connection_count(),
             dirty_tokens: self.dirty.len(),
             pending_pressure_mutations: self
