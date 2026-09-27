@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::{
@@ -209,12 +209,12 @@ impl RecorderStore {
                )
             "#,
             [],
-            |row| row.get::<_, u64>(0),
-        )?;
+            |row| row.get::<_, i64>(0),
+        )? as u64;
         let pressure_log_mutations =
             connection.query_row("SELECT COUNT(*) FROM pressure_log", [], |row| {
-                row.get::<_, u64>(0)
-            })?;
+                row.get::<_, i64>(0)
+            })? as u64;
 
         Ok(RecorderStoreStats {
             watched_tokens,
@@ -320,5 +320,5 @@ fn decode_checkpoint(value: &[u8]) -> Result<PressureFrontierSnapshot> {
 
 fn count_where(connection: &Connection, predicate: &str) -> Result<u64> {
     let sql = format!("SELECT COUNT(*) FROM token_state WHERE {predicate}");
-    Ok(connection.query_row(&sql, [], |row| row.get::<_, u64>(0))?)
+    Ok(connection.query_row(&sql, [], |row| row.get::<_, i64>(0))? as u64)
 }
