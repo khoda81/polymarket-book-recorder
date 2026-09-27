@@ -940,7 +940,7 @@ mod tests {
             let price = (((seed >> 24) % 100) as u16 + 1) * 100;
 
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let shares = if seed % 7 == 0 {
+            let shares = if seed.is_multiple_of(7) {
                 0.0
             } else {
                 ((seed >> 20) % 10_000) as f64 / 10.0 + 0.1
