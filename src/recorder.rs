@@ -199,7 +199,9 @@ pub async fn start(store: Arc<RecorderStore>) -> Result<RecorderRuntime> {
         }
 
         if record.has_pressure {
-            recorder.stored_pressure_tokens.insert(record.token_id.clone());
+            recorder
+                .stored_pressure_tokens
+                .insert(record.token_id.clone());
             if let Some(recording_since_ms) = record.recording_since_ms {
                 recorder
                     .recording_since
@@ -366,7 +368,11 @@ impl AgeRecorder {
             return false;
         }
 
-        info!(tokens = added.len(), watched = self.watched.len(), "watching tokens");
+        info!(
+            tokens = added.len(),
+            watched = self.watched.len(),
+            "watching tokens"
+        );
         self.subscriptions.add(added).await;
         true
     }
@@ -458,7 +464,12 @@ impl AgeRecorder {
                     && !self.memories.contains_key(*token_id)
                     && !self.stored_pressure_tokens.contains(*token_id)
                     && !self.seed_in_flight.contains(*token_id)
-                    && self.seed_retry_after_ms.get(*token_id).copied().unwrap_or(0) <= now
+                    && self
+                        .seed_retry_after_ms
+                        .get(*token_id)
+                        .copied()
+                        .unwrap_or(0)
+                        <= now
             })
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -519,11 +530,7 @@ impl AgeRecorder {
                                 continue;
                             }
                             let changes = apply_book_changes(&mut book, &event.changes)?;
-                            self.update_memory_changes(
-                                &token_id,
-                                changes,
-                                event.timestamp_ms,
-                            )?;
+                            self.update_memory_changes(&token_id, changes, event.timestamp_ms)?;
                         }
                         self.books.insert(token_id, book);
                     }
@@ -534,8 +541,7 @@ impl AgeRecorder {
                 warn!(error = %message, tokens = seed.token_ids.len(), "REST seed failed");
                 for token_id in &seed.token_ids {
                     if !self.memories.contains_key(token_id) {
-                        self.seed_retry_after_ms
-                            .insert(token_id.clone(), retry_at);
+                        self.seed_retry_after_ms.insert(token_id.clone(), retry_at);
                     }
                 }
             }
@@ -602,11 +608,7 @@ impl AgeRecorder {
                         };
 
                         let pressure_changes = apply_book_changes(book, &changes)?;
-                        self.update_memory_changes(
-                            &token_id,
-                            pressure_changes,
-                            timestamp_ms,
-                        )?;
+                        self.update_memory_changes(&token_id, pressure_changes, timestamp_ms)?;
                     }
                 }
                 MarketEvent::MarketResolved(event) => {
@@ -647,10 +649,7 @@ impl AgeRecorder {
         valid_through_ms: i64,
     ) -> Result<()> {
         self.ensure_memory(token_id)?;
-        let memory = self
-            .memories
-            .entry(token_id.to_owned())
-            .or_default();
+        let memory = self.memories.entry(token_id.to_owned()).or_default();
 
         if !memory.observe_levels(&levels, valid_through_ms as f64)? {
             return Ok(());
@@ -708,9 +707,7 @@ impl AgeRecorder {
     }
 
     fn ensure_memory(&mut self, token_id: &str) -> Result<()> {
-        if self.memories.contains_key(token_id)
-            || !self.stored_pressure_tokens.contains(token_id)
-        {
+        if self.memories.contains_key(token_id) || !self.stored_pressure_tokens.contains(token_id) {
             return Ok(());
         }
 
@@ -754,7 +751,9 @@ impl AgeRecorder {
                 (
                     Vec::new(),
                     RecorderCheckpointWrite::Replace(
-                        self.memories.get(token_id).map(PressureFrontierMemory::snapshot),
+                        self.memories
+                            .get(token_id)
+                            .map(PressureFrontierMemory::snapshot),
                     ),
                 )
             } else {
