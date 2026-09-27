@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,7 +19,11 @@ use tracing::{debug, warn};
 
 use crate::polymarket::{DEFAULT_CLOB_MARKET_WS_URL, MarketEvent, parse_market_message};
 
-const MAX_TOKENS_PER_CONNECTION: usize = 200;
+// Empirically, Polymarket can silently stop producing initial book snapshots
+// when a physical market websocket owns more than ~100 assets. The recorder
+// cannot tolerate "subscribed but never hydrated", so keep the physical cap
+// equal to the known-good wire batch size.
+const MAX_TOKENS_PER_CONNECTION: usize = 100;
 const MAX_SUBSCRIBE_BATCH_TOKENS: usize = 100;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -51,6 +58,7 @@ pub struct SubscriptionPool {
     event_tx: mpsc::Sender<SubscriptionEvent>,
     shards: BTreeMap<u64, Shard>,
     owner_by_token: HashMap<String, u64>,
+    connected_shards: Arc<AtomicUsize>,
     next_shard_id: u64,
 }
 
@@ -68,12 +76,21 @@ impl SubscriptionPool {
             event_tx,
             shards: BTreeMap::new(),
             owner_by_token: HashMap::new(),
+            connected_shards: Arc::new(AtomicUsize::new(0)),
             next_shard_id: 1,
         }
     }
 
     pub fn active_connection_count(&self) -> usize {
         self.shards.len()
+    }
+
+    pub fn connected_connection_count(&self) -> usize {
+        self.connected_shards.load(Ordering::Relaxed)
+    }
+
+    pub fn assigned_token_count(&self) -> usize {
+        self.owner_by_token.len()
     }
 
     pub async fn add(&mut self, token_ids: impl IntoIterator<Item = String>) {
@@ -96,9 +113,6 @@ impl SubscriptionPool {
                 continue;
             }
 
-            // Keep every wire subscribe request bounded to the same 100-token
-            // batches as the TypeScript recorder. The shard can still grow to
-            // 200 via an incremental subscribe on the same physical socket.
             let initial = take_first(&mut pending, MAX_SUBSCRIBE_BATCH_TOKENS);
             self.create_shard(initial);
         }
@@ -190,8 +204,17 @@ impl SubscriptionPool {
         let event_tx = self.event_tx.clone();
         let ws_url = self.ws_url.clone();
         let task_tokens = token_ids.clone();
+        let connected_shards = self.connected_shards.clone();
         let task = tokio::spawn(async move {
-            run_shard(shard_id, ws_url, task_tokens, command_rx, event_tx).await;
+            run_shard(
+                shard_id,
+                ws_url,
+                task_tokens,
+                command_rx,
+                event_tx,
+                connected_shards,
+            )
+            .await;
         });
 
         self.shards.insert(
@@ -219,6 +242,7 @@ async fn run_shard(
     mut token_ids: BTreeSet<String>,
     mut command_rx: mpsc::Receiver<ShardCommand>,
     event_tx: mpsc::Sender<SubscriptionEvent>,
+    connected_shards: Arc<AtomicUsize>,
 ) {
     let mut snapshot_requested_at = HashMap::<String, i64>::new();
 
@@ -243,6 +267,7 @@ async fn run_shard(
             }
         };
 
+        let _connected_guard = ConnectedShardGuard::new(connected_shards.clone());
         debug!(
             shard_id,
             tokens = token_ids.len(),
@@ -431,6 +456,23 @@ fn drain_commands_while_disconnected(
                 snapshot_requested_at.clear();
             }
         }
+    }
+}
+
+struct ConnectedShardGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl ConnectedShardGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self { count }
+    }
+}
+
+impl Drop for ConnectedShardGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
