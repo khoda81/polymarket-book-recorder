@@ -20,9 +20,10 @@ pub struct PressureLevelChange {
 
 /// Opaque v6 persisted pressure state.
 ///
-/// There is deliberately no separately persisted current frontier. The current
-/// aggregate level at a price is the difference between adjacent cumulative
-/// run volumes.
+/// Current order-book levels live exactly once, as per-price shares in the
+/// runs. Cumulative current pressure is derived by prefix-summing those shares.
+/// Historical lower edges are likewise derived from the current cumulative
+/// pressure / next frozen step and are never persisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PressureFrontierSnapshot {
     version: u8,
@@ -40,18 +41,21 @@ enum SnapshotState {
     },
 }
 
-/// One price interval in the pressure surface.
+/// One explicit price boundary in the pressure surface.
 ///
-/// volume is current cumulative resting volume through this price. Historical
-/// pressure is a stack of upper edges, high-to-low. The lower edge of a frozen
-/// step is therefore derived from the next step, or from volume for the last
-/// step; it is intentionally impossible to store a gap, overlap, or zero-width
-/// band.
+/// shares is the exact current aggregate resting level at this price. A
+/// history-only price boundary therefore has shares == 0. Current cumulative
+/// pressure through a run is the prefix sum of all run shares.
+///
+/// frozen_steps stores historical upper edges, high-to-low. Its interval lower
+/// edges are implied by the next step, or by current cumulative pressure for
+/// the final step. Gaps, overlaps, and zero-width stored bands are therefore
+/// not representable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PressureRun {
     price: u16,
-    volume: f64,
+    shares: f64,
     frozen_steps: Vec<FrozenStep>,
 }
 
@@ -137,13 +141,13 @@ impl PressureFrontierMemory {
     ) -> Result<bool> {
         let valid_through_ms = self.normalize_time(valid_through_ms)?;
         let previous_time = self.valid_through_ms();
-        let previous_levels = self.current_levels_map()?;
-        let next_levels = normalize_levels(levels);
+        let previous = self.current_levels_map();
+        let next = normalize_levels(levels);
+        let changes = changed_levels(&previous, &next);
+        let geometry_changed = !changes.is_empty();
 
-        let deltas = level_deltas(&previous_levels, &next_levels);
-        let geometry_changed = !deltas.is_empty();
         let mut runs = self.take_runs();
-        apply_deltas(&mut runs, &deltas, previous_time)?;
+        apply_level_changes(&mut runs, &changes, previous_time)?;
         self.state = MemoryState::Observed {
             valid_through_ms,
             runs,
@@ -159,7 +163,9 @@ impl PressureFrontierMemory {
     ) -> Result<bool> {
         let valid_through_ms = self.normalize_time(valid_through_ms)?;
 
-        let mut final_by_price = BTreeMap::<u16, f64>::new();
+        let previous = self.current_levels_map();
+        let mut changed = BTreeMap::<u16, f64>::new();
+
         for change in changes {
             if change.price == 0
                 || change.price > PRICE_SCALE
@@ -168,37 +174,28 @@ impl PressureFrontierMemory {
             {
                 continue;
             }
-            final_by_price.insert(change.price, change.shares);
+
+            let old_shares = previous.get(&change.price).copied().unwrap_or(0.0);
+            if same_volume(change.shares, old_shares) {
+                changed.remove(&change.price);
+            } else {
+                changed.insert(change.price, change.shares);
+            }
         }
 
-        if final_by_price.is_empty() {
+        if changed.is_empty() {
             return Ok(false);
         }
 
         let previous_time = self.valid_through_ms();
-        let previous_levels = self.current_levels_map()?;
-        let mut deltas = Vec::new();
-
-        for (price, shares) in final_by_price {
-            let previous = previous_levels.get(&price).copied().unwrap_or(0.0);
-            if same_volume(shares, previous) {
-                continue;
-            }
-            deltas.push(PressureLevelDelta {
-                price,
-                delta: shares - previous,
-            });
-        }
-
-        let geometry_changed = !deltas.is_empty();
         let mut runs = self.take_runs();
-        apply_deltas(&mut runs, &deltas, previous_time)?;
+        apply_level_changes(&mut runs, &changed, previous_time)?;
         self.state = MemoryState::Observed {
             valid_through_ms,
             runs,
         };
 
-        Ok(geometry_changed || previous_time != Some(valid_through_ms))
+        Ok(true)
     }
 
     pub fn observe_through(&mut self, valid_through_ms: i64) -> Result<bool> {
@@ -212,12 +209,23 @@ impl PressureFrontierMemory {
         Ok(previous_time != Some(valid_through_ms))
     }
 
-    pub fn current_levels(&self) -> Result<Vec<FrontierLevel>> {
-        Ok(self
-            .current_levels_map()?
+    pub fn current_levels(&self) -> Vec<FrontierLevel> {
+        self.current_levels_map()
             .into_iter()
             .map(|(key, weight)| FrontierLevel { key, weight })
-            .collect())
+            .collect()
+    }
+
+    fn current_levels_map(&self) -> BTreeMap<u16, f64> {
+        let runs = match &self.state {
+            MemoryState::Unobserved => return BTreeMap::new(),
+            MemoryState::Observed { runs, .. } => runs,
+        };
+
+        runs.iter()
+            .filter(|run| run.shares > 0.0)
+            .map(|run| (run.price, run.shares))
+            .collect()
     }
 
     fn valid_through_ms(&self) -> Option<i64> {
@@ -245,21 +253,6 @@ impl PressureFrontierMemory {
             MemoryState::Observed { runs, .. } => runs,
         }
     }
-
-    fn current_levels_map(&self) -> Result<BTreeMap<u16, f64>> {
-        let runs = match &self.state {
-            MemoryState::Unobserved => return Ok(BTreeMap::new()),
-            MemoryState::Observed { runs, .. } => runs,
-        };
-
-        current_levels_from_runs(runs)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PressureLevelDelta {
-    price: u16,
-    delta: f64,
 }
 
 fn normalize_levels(levels: &[FrontierLevel]) -> BTreeMap<u16, f64> {
@@ -277,33 +270,10 @@ fn normalize_levels(levels: &[FrontierLevel]) -> BTreeMap<u16, f64> {
     by_price
 }
 
-fn current_levels_from_runs(runs: &[PressureRun]) -> Result<BTreeMap<u16, f64>> {
-    let mut result = BTreeMap::new();
-    let mut previous_volume = 0.0;
-
-    for run in runs {
-        let weight = run.volume - previous_volume;
-        if weight < 0.0 && !same_volume(weight, 0.0) {
-            bail!(
-                "pressure run volume decreased at price {}: previous={} current={}",
-                run.price,
-                previous_volume,
-                run.volume
-            );
-        }
-        if !same_volume(weight, 0.0) {
-            result.insert(run.price, weight);
-        }
-        previous_volume = run.volume;
-    }
-
-    Ok(result)
-}
-
-fn level_deltas(
+fn changed_levels(
     previous: &BTreeMap<u16, f64>,
     next: &BTreeMap<u16, f64>,
-) -> Vec<PressureLevelDelta> {
+) -> BTreeMap<u16, f64> {
     previous
         .keys()
         .chain(next.keys())
@@ -313,88 +283,72 @@ fn level_deltas(
         .filter_map(|price| {
             let previous = previous.get(&price).copied().unwrap_or(0.0);
             let next = next.get(&price).copied().unwrap_or(0.0);
-            (!same_volume(previous, next)).then_some(PressureLevelDelta {
-                price,
-                delta: next - previous,
-            })
+            (!same_volume(previous, next)).then_some((price, next))
         })
         .collect()
 }
 
-fn apply_deltas(
+fn apply_level_changes(
     runs: &mut Vec<PressureRun>,
-    deltas: &[PressureLevelDelta],
+    changes: &BTreeMap<u16, f64>,
     previous_valid_through_ms: Option<i64>,
 ) -> Result<()> {
-    let mut actual = deltas
-        .iter()
-        .copied()
-        .filter(|delta| {
-            delta.price > 0
-                && delta.price <= PRICE_SCALE
-                && delta.delta.is_finite()
-                && delta.delta != 0.0
-        })
-        .collect::<Vec<_>>();
-    actual.sort_by_key(|delta| delta.price);
-
-    if actual.is_empty() {
+    if changes.is_empty() {
         return Ok(());
     }
 
-    for delta in &actual {
-        split_at(runs, delta.price);
+    for (&price, &shares) in changes {
+        ensure!(
+            price > 0
+                && price <= PRICE_SCALE
+                && shares.is_finite()
+                && shares >= 0.0,
+            "invalid pressure level change"
+        );
+        split_at(runs, price);
     }
 
-    let first_changed = actual[0].price;
-    let first_run = lower_bound_run(runs, first_changed);
-    let mut delta_index = 0;
-    let mut cumulative_delta = 0.0;
+    let mut old_volume = 0.0;
+    let mut next_volume = 0.0;
 
-    for run in runs.iter_mut().skip(first_run) {
-        while delta_index < actual.len() && actual[delta_index].price <= run.price {
-            cumulative_delta += actual[delta_index].delta;
-            delta_index += 1;
+    for run in runs.iter_mut() {
+        old_volume += run.shares;
+
+        if let Some(&shares) = changes.get(&run.price) {
+            run.shares = shares;
         }
+        next_volume += run.shares;
 
-        if cumulative_delta == 0.0 {
+        if same_volume(old_volume, next_volume) {
             continue;
         }
 
-        let next_volume = run.volume + cumulative_delta;
-        ensure!(
-            next_volume >= 0.0 || same_volume(next_volume, 0.0),
-            "pressure delta would make cumulative volume negative at price {}",
-            run.price
-        );
-        let next_volume = if same_volume(next_volume, 0.0) {
-            0.0
-        } else {
-            next_volume
-        };
-
-        if same_volume(next_volume, run.volume) {
-            continue;
-        }
-
-        transition_run(run, next_volume, previous_valid_through_ms)?;
+        transition_steps(
+            &mut run.frozen_steps,
+            old_volume,
+            next_volume,
+            previous_valid_through_ms,
+        )?;
     }
 
     merge_adjacent_runs(runs);
     Ok(())
 }
 
-fn transition_run(
-    run: &mut PressureRun,
+fn transition_steps(
+    frozen_steps: &mut Vec<FrozenStep>,
+    old_volume: f64,
     next_volume: f64,
     previous_valid_through_ms: Option<i64>,
 ) -> Result<()> {
     ensure!(
-        next_volume.is_finite() && next_volume >= 0.0,
+        old_volume.is_finite()
+            && old_volume >= 0.0
+            && next_volume.is_finite()
+            && next_volume >= 0.0,
         "pressure volume must be finite and non-negative"
     );
 
-    let old_volume = run.volume;
     if same_volume(old_volume, next_volume) {
         return Ok(());
     }
@@ -404,26 +358,24 @@ fn transition_run(
             anyhow::anyhow!("cannot freeze current pressure before it has a validity timestamp")
         })?;
 
-        let extends_last = run
-            .frozen_steps
+        let extends_last = frozen_steps
             .last()
             .is_some_and(|step| step.valid_through_ms == valid_through_ms);
 
         if !extends_last {
-            run.frozen_steps.push(FrozenStep {
+            frozen_steps.push(FrozenStep {
                 hi_volume: old_volume,
                 valid_through_ms,
             });
         }
     } else {
-        while run.frozen_steps.last().is_some_and(|step| {
+        while frozen_steps.last().is_some_and(|step| {
             step.hi_volume <= next_volume || same_volume(step.hi_volume, next_volume)
         }) {
-            run.frozen_steps.pop();
+            frozen_steps.pop();
         }
     }
 
-    run.volume = next_volume;
     Ok(())
 }
 
@@ -437,13 +389,17 @@ fn split_at(runs: &mut Vec<PressureRun>, price: u16) {
         return;
     }
 
-    let source = index.checked_sub(1).and_then(|i| runs.get(i)).cloned();
+    let frozen_steps = index
+        .checked_sub(1)
+        .and_then(|i| runs.get(i))
+        .map_or_else(Vec::new, |run| run.frozen_steps.clone());
+
     runs.insert(
         index,
         PressureRun {
             price,
-            volume: source.as_ref().map_or(0.0, |run| run.volume),
-            frozen_steps: source.map_or_else(Vec::new, |run| run.frozen_steps),
+            shares: 0.0,
+            frozen_steps,
         },
     );
 }
@@ -458,12 +414,15 @@ fn merge_adjacent_runs(runs: &mut Vec<PressureRun>) {
         if merged.is_empty() && empty_state(&run) {
             continue;
         }
-        if merged
-            .last()
-            .is_some_and(|previous| states_equal(previous, &run))
-        {
+
+        let redundant = run.shares == 0.0
+            && merged
+                .last()
+                .is_some_and(|previous| frozen_steps_equal(previous, &run));
+        if redundant {
             continue;
         }
+
         merged.push(run);
     }
     *runs = merged;
@@ -473,16 +432,15 @@ fn lower_bound_run(runs: &[PressureRun], price: u16) -> usize {
     runs.partition_point(|run| run.price < price)
 }
 
-fn states_equal(a: &PressureRun, b: &PressureRun) -> bool {
-    same_volume(a.volume, b.volume)
-        && a.frozen_steps.len() == b.frozen_steps.len()
+fn frozen_steps_equal(a: &PressureRun, b: &PressureRun) -> bool {
+    a.frozen_steps.len() == b.frozen_steps.len()
         && a.frozen_steps.iter().zip(&b.frozen_steps).all(|(a, b)| {
             same_volume(a.hi_volume, b.hi_volume) && a.valid_through_ms == b.valid_through_ms
         })
 }
 
 fn empty_state(run: &PressureRun) -> bool {
-    same_volume(run.volume, 0.0) && run.frozen_steps.is_empty()
+    run.shares == 0.0 && run.frozen_steps.is_empty()
 }
 
 fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<()> {
@@ -492,7 +450,8 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
     );
 
     let mut previous_price = 0;
-    let mut previous_volume = 0.0;
+    let mut current_volume = 0.0;
+    let mut previous_run: Option<&PressureRun> = None;
 
     for (run_index, run) in runs.iter().enumerate() {
         ensure!(
@@ -500,12 +459,26 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
             "pressure run prices must be strictly increasing non-zero boundaries"
         );
         ensure!(
-            run.volume.is_finite() && run.volume >= 0.0,
-            "run[{run_index}].volume must be finite and non-negative"
+            run.shares.is_finite() && run.shares >= 0.0,
+            "run[{run_index}].shares must be finite and non-negative"
         );
+
+        if let Some(previous) = previous_run {
+            ensure!(
+                run.shares > 0.0 || !frozen_steps_equal(previous, run),
+                "run[{run_index}] is a redundant zero-share price boundary"
+            );
+        } else {
+            ensure!(
+                !empty_state(run),
+                "pressure field must not store a leading empty run"
+            );
+        }
+
+        current_volume += run.shares;
         ensure!(
-            run.volume >= previous_volume || same_volume(run.volume, previous_volume),
-            "edge pressure must be non-decreasing in price"
+            current_volume.is_finite(),
+            "run[{run_index}] cumulative current volume is not finite"
         );
 
         let mut previous_hi: Option<f64> = None;
@@ -520,7 +493,7 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
                 "run[{run_index}].frozenSteps[{step_index}] has invalid valid-through timestamp"
             );
             ensure!(
-                step.hi_volume > run.volume && !same_volume(step.hi_volume, run.volume),
+                step.hi_volume > current_volume && !same_volume(step.hi_volume, current_volume),
                 "run[{run_index}].frozenSteps[{step_index}] must sit above current volume"
             );
             if let Some(previous_hi) = previous_hi {
@@ -541,13 +514,9 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
         }
 
         previous_price = run.price;
-        previous_volume = run.volume;
+        previous_run = Some(run);
     }
 
-    ensure!(
-        !runs.first().is_some_and(empty_state),
-        "pressure field must not store a leading empty run"
-    );
     Ok(())
 }
 
@@ -569,8 +538,11 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
         legacy.field.max_price
     );
 
-    let current = normalize_legacy_levels(&legacy.current)?;
-    let mut level_iter = current.iter().peekable();
+    // In v5 the current exact frontier and cumulative run volume redundantly
+    // described the same state. The exact frontier is authoritative during
+    // migration: it never acquired the summation drift that affected the
+    // materialized cumulative copy.
+    let mut current = normalize_legacy_levels(&legacy.current)?;
     let mut cumulative = 0.0;
     let mut previous_price = 0;
     let mut runs = Vec::with_capacity(legacy.field.runs.len());
@@ -582,13 +554,8 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
             run.price
         );
 
-        while let Some((&price, &weight)) = level_iter.peek().copied() {
-            if price > run.price {
-                break;
-            }
-            cumulative += weight;
-            level_iter.next();
-        }
+        let shares = current.remove(&run.price).unwrap_or(0.0);
+        cumulative += shares;
 
         let mut frozen_steps = Vec::<FrozenStep>::new();
         let mut previous_hi: Option<f64> = None;
@@ -613,6 +580,7 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
                     "v5 run[{run_index}] frozen bands are not high-to-low"
                 );
             }
+            previous_hi = Some(band.hi_volume);
 
             let valid_through_ms = legacy_timestamp_ms(band.valid_through_ms)?;
             if frozen_steps
@@ -626,7 +594,6 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
                 hi_volume: band.hi_volume,
                 valid_through_ms,
             });
-            previous_hi = Some(band.hi_volume);
         }
 
         while frozen_steps.last().is_some_and(|step| {
@@ -637,14 +604,14 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
 
         runs.push(PressureRun {
             price: run.price,
-            volume: cumulative,
+            shares,
             frozen_steps,
         });
         previous_price = run.price;
     }
 
-    if let Some((&last_level_price, _)) = level_iter.peek().copied() {
-        bail!("v5 pressure field is missing current frontier boundary at price {last_level_price}");
+    if let Some((&missing_price, _)) = current.first_key_value() {
+        bail!("v5 pressure field is missing current frontier boundary at price {missing_price}");
     }
 
     merge_adjacent_runs(&mut runs);
@@ -660,7 +627,7 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
         }
         None => {
             ensure!(
-                runs.is_empty() && current.is_empty(),
+                runs.is_empty(),
                 "v5 unobserved pressure snapshot contains state"
             );
             MemoryState::Unobserved
@@ -768,7 +735,7 @@ mod tests {
         let SnapshotState::Observed { runs, .. } = memory.snapshot().state else {
             panic!("expected observed pressure");
         };
-        assert_eq!(runs[0].volume, 4.0);
+        assert_eq!(runs[0].shares, 4.0);
         assert_eq!(
             runs[0].frozen_steps,
             vec![FrozenStep {
@@ -790,7 +757,7 @@ mod tests {
         let SnapshotState::Observed { runs, .. } = memory.snapshot().state else {
             panic!("expected observed pressure");
         };
-        assert_eq!(runs[0].volume, 8.0);
+        assert_eq!(runs[0].shares, 8.0);
         assert_eq!(
             runs[0].frozen_steps,
             vec![FrozenStep {
@@ -847,11 +814,11 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(runs[0].volume, 6.0);
+        assert_eq!(runs[0].shares, 6.0);
     }
 
     #[test]
-    fn current_levels_are_derived_from_run_volume_differences() {
+    fn current_levels_are_stored_exactly_once_as_run_shares() {
         let mut memory = PressureFrontierMemory::default();
         memory
             .observe_levels(
@@ -870,7 +837,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            memory.current_levels().unwrap(),
+            memory.current_levels(),
             vec![
                 FrontierLevel {
                     key: 1_000,
@@ -882,10 +849,16 @@ mod tests {
                 },
             ]
         );
+
+        let SnapshotState::Observed { runs, .. } = memory.snapshot().state else {
+            panic!("expected observed pressure");
+        };
+        assert_eq!(runs[0].shares, 20.0);
+        assert_eq!(runs[1].shares, 35.0);
     }
 
     #[test]
-    fn v5_migration_drops_zero_width_band_and_recomputes_current_volume() {
+    fn v5_migration_drops_zero_width_band_and_trusts_exact_current_frontier() {
         let json = r#"{
           "version": 5,
           "current": [{"key": 5000, "weight": 4.0}],
@@ -894,7 +867,7 @@ mod tests {
             "currentValidThroughMs": 3000,
             "runs": [{
               "price": 5000,
-              "volume": 4.000000000000001,
+              "volume": 999999.0,
               "frozenBands": [
                 {"loVolume": 10.0, "hiVolume": 10.0, "validThroughMs": 1000},
                 {"loVolume": 4.0, "hiVolume": 10.0, "validThroughMs": 2000}
@@ -905,7 +878,7 @@ mod tests {
 
         let memory = migrate_v5_checkpoint_json(json).unwrap();
         assert_eq!(
-            memory.current_levels().unwrap(),
+            memory.current_levels(),
             vec![FrontierLevel {
                 key: 5_000,
                 weight: 4.0,
@@ -920,6 +893,7 @@ mod tests {
             panic!("expected observed pressure");
         };
         assert_eq!(valid_through_ms, 3_000);
+        assert_eq!(runs[0].shares, 4.0);
         assert_eq!(
             runs[0].frozen_steps,
             vec![FrozenStep {
@@ -930,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_updates_keep_run_volumes_equivalent_to_exact_levels() {
+    fn randomized_updates_preserve_exact_current_levels() {
         let mut memory = PressureFrontierMemory::default();
         let mut reference = BTreeMap::<u16, f64>::new();
         let mut seed = 0x5eed_cafe_u64;
@@ -958,18 +932,10 @@ mod tests {
 
             let actual = memory
                 .current_levels()
-                .unwrap()
                 .into_iter()
                 .map(|level| (level.key, level.weight))
                 .collect::<BTreeMap<_, _>>();
-            assert_eq!(actual.len(), reference.len());
-            for (&price, &expected) in &reference {
-                assert!(
-                    same_volume(actual[&price], expected),
-                    "price={price} expected={expected} actual={}",
-                    actual[&price]
-                );
-            }
+            assert_eq!(actual, reference);
 
             if step % 100 == 0 {
                 let restored = PressureFrontierMemory::restore(memory.snapshot()).unwrap();
@@ -979,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_round_trip_cannot_encode_band_lower_edges() {
+    fn snapshot_round_trip_cannot_encode_redundant_current_or_lower_edges() {
         let mut memory = PressureFrontierMemory::default();
         memory
             .observe_levels(
@@ -1004,6 +970,7 @@ mod tests {
         let text = value.to_string();
         assert!(!text.contains("loVolume"));
         assert!(!text.contains("\"current\""));
+        assert_eq!(value["state"]["runs"][0]["shares"], 4.0);
 
         let snapshot: PressureFrontierSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(PressureFrontierMemory::restore(snapshot).unwrap(), memory);
