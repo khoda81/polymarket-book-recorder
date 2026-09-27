@@ -42,6 +42,10 @@ Or choose them explicitly:
 
     cargo run --release -- --database .data/rust-recorder.sqlite --port 3002
 
+Migrate/check a database without starting live ingestion:
+
+    cargo run --release -- --database .data/rust-recorder.sqlite --migrate-only
+
 See all CLI options with:
 
     cargo run --release -- --help
