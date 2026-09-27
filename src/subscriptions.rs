@@ -96,7 +96,10 @@ impl SubscriptionPool {
                 continue;
             }
 
-            let initial = take_first(&mut pending, MAX_TOKENS_PER_CONNECTION);
+            // Keep every wire subscribe request bounded to the same 100-token
+            // batches as the TypeScript recorder. The shard can still grow to
+            // 200 via an incremental subscribe on the same physical socket.
+            let initial = take_first(&mut pending, MAX_SUBSCRIBE_BATCH_TOKENS);
             self.create_shard(initial);
         }
     }

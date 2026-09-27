@@ -340,10 +340,14 @@ impl AgeRecorder {
                 let _ = reply.send(self.stats().map_err(|error| error.to_string()));
             }
             RecorderCommand::Stop { reply } => {
-                let result = self.shutdown().await.map_err(|error| error.to_string());
-                let success = result.is_ok();
-                let _ = reply.send(result);
-                return Ok(success);
+                let result = self.shutdown().await;
+                let response = result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(ToString::to_string);
+                let _ = reply.send(response);
+                result?;
+                return Ok(true);
             }
         }
         Ok(false)
@@ -803,13 +807,13 @@ fn apply_book_changes(
     book: &mut AskBook,
     changes: &[RawPriceChange],
 ) -> Result<Vec<PressureLevelChange>> {
-    changes
-        .iter()
-        .filter_map(|change| {
-            book.apply_change(&change.side, &change.price, &change.size)
-                .transpose()
-        })
-        .collect()
+    let mut pressure_changes = Vec::new();
+    for change in changes {
+        if let Some(change) = book.apply_change(&change.side, &change.price, &change.size)? {
+            pressure_changes.push(change);
+        }
+    }
+    Ok(pressure_changes)
 }
 
 fn dedupe(token_ids: Vec<String>) -> Vec<String> {
