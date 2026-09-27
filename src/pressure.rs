@@ -181,10 +181,13 @@ impl PressureFrontierMemory {
 
         for (price, shares) in final_by_price {
             let previous = previous_levels.get(&price).copied().unwrap_or(0.0);
-            let delta = shares - previous;
-            if delta != 0.0 {
-                deltas.push(PressureLevelDelta { price, delta });
+            if same_volume(shares, previous) {
+                continue;
             }
+            deltas.push(PressureLevelDelta {
+                price,
+                delta: shares - previous,
+            });
         }
 
         let geometry_changed = !deltas.is_empty();
@@ -308,9 +311,12 @@ fn level_deltas(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter_map(|price| {
-            let delta = next.get(&price).copied().unwrap_or(0.0)
-                - previous.get(&price).copied().unwrap_or(0.0);
-            (delta != 0.0).then_some(PressureLevelDelta { price, delta })
+            let previous = previous.get(&price).copied().unwrap_or(0.0);
+            let next = next.get(&price).copied().unwrap_or(0.0);
+            (!same_volume(previous, next)).then_some(PressureLevelDelta {
+                price,
+                delta: next - previous,
+            })
         })
         .collect()
 }
@@ -930,9 +936,7 @@ mod tests {
         let mut seed = 0x5eed_cafe_u64;
 
         for step in 1..=2_000_i64 {
-            seed = seed
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1);
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             let price = (((seed >> 24) % 100) as u16 + 1) * 100;
 
             seed = seed
@@ -951,10 +955,7 @@ mod tests {
             }
 
             memory
-                .update_levels(
-                    &[PressureLevelChange { price, shares }],
-                    step * 10,
-                )
+                .update_levels(&[PressureLevelChange { price, shares }], step * 10)
                 .unwrap();
 
             let actual = memory
@@ -973,8 +974,7 @@ mod tests {
             }
 
             if step % 100 == 0 {
-                let restored =
-                    PressureFrontierMemory::restore(memory.snapshot()).unwrap();
+                let restored = PressureFrontierMemory::restore(memory.snapshot()).unwrap();
                 assert_eq!(restored, memory);
             }
         }
