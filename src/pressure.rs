@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const PRICE_SCALE: u16 = 10_000;
@@ -201,7 +201,10 @@ impl MaterializedPressureField {
             if merged.is_empty() && empty_state(&run) {
                 continue;
             }
-            if merged.last().is_some_and(|previous| states_equal(previous, &run)) {
+            if merged
+                .last()
+                .is_some_and(|previous| states_equal(previous, &run))
+            {
                 continue;
             }
             merged.push(run);
@@ -475,17 +478,16 @@ fn normalize_levels(levels: &[FrontierLevel]) -> BTreeMap<u16, f64> {
     by_price
 }
 
-fn union_changed_prices(
-    previous: &BTreeMap<u16, f64>,
-    next: &BTreeMap<u16, f64>,
-) -> Vec<u16> {
+fn union_changed_prices(previous: &BTreeMap<u16, f64>, next: &BTreeMap<u16, f64>) -> Vec<u16> {
     previous
         .keys()
         .chain(next.keys())
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter(|price| previous.get(price).copied().unwrap_or(0.0) != next.get(price).copied().unwrap_or(0.0))
+        .filter(|price| {
+            previous.get(price).copied().unwrap_or(0.0) != next.get(price).copied().unwrap_or(0.0)
+        })
         .collect()
 }
 
@@ -506,8 +508,9 @@ fn transition_run(
     }
 
     if next_volume < old_volume {
-        let valid_through_ms = current_valid_through_ms
-            .ok_or_else(|| anyhow::anyhow!("cannot freeze current pressure before it has a validity timestamp"))?;
+        let valid_through_ms = current_valid_through_ms.ok_or_else(|| {
+            anyhow::anyhow!("cannot freeze current pressure before it has a validity timestamp")
+        })?;
 
         if let Some(last) = run.frozen_bands.last() {
             ensure!(
@@ -517,7 +520,8 @@ fn transition_run(
         }
 
         if let Some(last) = run.frozen_bands.last_mut() {
-            if last.valid_through_ms == valid_through_ms && same_volume(last.lo_volume, old_volume) {
+            if last.valid_through_ms == valid_through_ms && same_volume(last.lo_volume, old_volume)
+            {
                 last.lo_volume = next_volume;
             } else {
                 run.frozen_bands.push(PressureBand {
