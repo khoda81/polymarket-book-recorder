@@ -270,10 +270,7 @@ fn normalize_levels(levels: &[FrontierLevel]) -> BTreeMap<u16, f64> {
     by_price
 }
 
-fn changed_levels(
-    previous: &BTreeMap<u16, f64>,
-    next: &BTreeMap<u16, f64>,
-) -> BTreeMap<u16, f64> {
+fn changed_levels(previous: &BTreeMap<u16, f64>, next: &BTreeMap<u16, f64>) -> BTreeMap<u16, f64> {
     previous
         .keys()
         .chain(next.keys())
@@ -299,10 +296,7 @@ fn apply_level_changes(
 
     for (&price, &shares) in changes {
         ensure!(
-            price > 0
-                && price <= PRICE_SCALE
-                && shares.is_finite()
-                && shares >= 0.0,
+            price > 0 && price <= PRICE_SCALE && shares.is_finite() && shares >= 0.0,
             "invalid pressure level change"
         );
         split_at(runs, price);
