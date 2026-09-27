@@ -83,7 +83,7 @@ fn migrates_v5_checkpoint_and_tail_to_canonical_v6() {
     let snapshot = record.pressure.unwrap();
     let memory = PressureFrontierMemory::restore(snapshot.clone()).unwrap();
     assert_eq!(
-        memory.current_levels().unwrap(),
+        memory.current_levels(),
         vec![FrontierLevel {
             key: 5_000,
             weight: 4.0,
@@ -94,7 +94,7 @@ fn migrates_v5_checkpoint_and_tail_to_canonical_v6() {
     assert_eq!(json["version"], 6);
     assert_eq!(json["state"]["kind"], "observed");
     assert_eq!(json["state"]["validThroughMs"], 2_000);
-    assert_eq!(json["state"]["runs"][0]["volume"], 4.0);
+    assert_eq!(json["state"]["runs"][0]["shares"], 4.0);
     assert_eq!(json["state"]["runs"][0]["frozenSteps"][0]["hiVolume"], 10.0);
     assert_eq!(
         json["state"]["runs"][0]["frozenSteps"][0]["validThroughMs"],
