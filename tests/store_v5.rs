@@ -1,12 +1,12 @@
 use std::io::Write;
 
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compression, write::GzEncoder};
 use polymarket_book_recorder::{
     pressure::{FrontierLevel, PressureBand, PressureFrontierSnapshot, PressureLevelChange},
-    pressure_log::{encode_pressure_mutation, RecorderPressureMutation},
+    pressure_log::{RecorderPressureMutation, encode_pressure_mutation},
     store::RecorderStore,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 #[test]
 fn loads_v5_checkpoint_and_replays_binary_tail() {
