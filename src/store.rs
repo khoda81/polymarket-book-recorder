@@ -10,16 +10,19 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use tracing::info;
 
 use crate::{
-    pressure::{PressureFrontierMemory, PressureFrontierSnapshot},
+    pressure::{
+        PressureFrontierMemory, PressureFrontierSnapshot, migrate_v5_checkpoint_json,
+    },
     pressure_log::{
-        RecorderPressureMutation, decode_pressure_mutation, encode_pressure_mutation,
-        replay_pressure_mutation,
+        RecorderPressureMutation, decode_pressure_mutation, decode_v5_pressure_mutation,
+        encode_pressure_mutation, replay_pressure_mutation,
     },
 };
 
-pub const RECORDER_DATABASE_VERSION: i64 = 5;
+pub const RECORDER_DATABASE_VERSION: i64 = 6;
 pub const RECORDER_CHECKPOINT_MUTATIONS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -117,10 +120,10 @@ impl RecorderStore {
                 .with_context(|| format!("creating database directory {}", parent.display()))?;
         }
 
-        let connection = Connection::open(&path)
+        let mut connection = Connection::open(&path)
             .with_context(|| format!("opening recorder database {}", path.display()))?;
         configure_connection(&connection)?;
-        initialize_database(&connection)?;
+        initialize_database(&mut connection)?;
         let mutation_counts = load_mutation_counts(&connection)?;
 
         Ok(Self {
@@ -237,12 +240,7 @@ impl RecorderStore {
                     format!("replaying pressure mutation seq={seq} token={token_id}")
                 })?;
             }
-
-            let snapshot = memory.snapshot();
-            PressureFrontierMemory::restore(snapshot.clone()).with_context(|| {
-                format!("validating replayed pressure state for token {token_id}")
-            })?;
-            pressure = Some(snapshot);
+            pressure = Some(memory.snapshot());
         }
 
         Ok(Some(RecorderStoreRecord {
@@ -443,9 +441,14 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn initialize_database(connection: &Connection) -> Result<()> {
+fn initialize_database(connection: &mut Connection) -> Result<()> {
     let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     if version == RECORDER_DATABASE_VERSION {
+        return Ok(());
+    }
+
+    if version == 5 {
+        migrate_database_v5_to_v6(connection)?;
         return Ok(());
     }
 
@@ -494,6 +497,108 @@ fn initialize_database(connection: &Connection) -> Result<()> {
     )
 }
 
+fn migrate_database_v5_to_v6(connection: &mut Connection) -> Result<()> {
+    #[derive(Debug)]
+    struct LegacyRecord {
+        token_id: String,
+        checkpoint: Option<Vec<u8>>,
+        mutations: Vec<(i64, Vec<u8>)>,
+    }
+
+    let token_rows = {
+        let mut statement = connection.prepare(
+            r#"
+            SELECT token_id, pressure
+            FROM token_state s
+            WHERE s.pressure IS NOT NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM pressure_log l
+                   WHERE l.token_id = s.token_id
+               )
+            ORDER BY token_id
+            "#,
+        )?;
+
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut legacy_records = Vec::with_capacity(token_rows.len());
+    for (token_id, checkpoint) in token_rows {
+        let mutations = {
+            let mut statement = connection.prepare(
+                r#"
+                SELECT seq, payload
+                FROM pressure_log
+                WHERE token_id = ?1
+                ORDER BY seq
+                "#,
+            )?;
+            statement
+                .query_map([&token_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        legacy_records.push(LegacyRecord {
+            token_id,
+            checkpoint,
+            mutations,
+        });
+    }
+
+    let mut migrated = Vec::<(String, Vec<u8>)>::with_capacity(legacy_records.len());
+    for record in legacy_records {
+        let mut memory = match record.checkpoint {
+            Some(checkpoint) => decode_v5_checkpoint(&checkpoint).with_context(|| {
+                format!("migrating v5 pressure checkpoint for token {}", record.token_id)
+            })?,
+            None => PressureFrontierMemory::default(),
+        };
+
+        for (seq, payload) in record.mutations {
+            let mutation = decode_v5_pressure_mutation(&payload).with_context(|| {
+                format!(
+                    "decoding v5 pressure mutation seq={seq} token={}",
+                    record.token_id
+                )
+            })?;
+            replay_pressure_mutation(&mut memory, mutation).with_context(|| {
+                format!(
+                    "replaying v5 pressure mutation seq={seq} token={}",
+                    record.token_id
+                )
+            })?;
+        }
+
+        migrated.push((record.token_id, encode_checkpoint(&memory.snapshot())?));
+    }
+
+    let transaction = connection.transaction()?;
+    for (token_id, checkpoint) in &migrated {
+        transaction.execute(
+            "UPDATE token_state SET pressure = ?1 WHERE token_id = ?2",
+            params![checkpoint, token_id],
+        )?;
+    }
+    transaction.execute("DELETE FROM pressure_log", [])?;
+    transaction.pragma_update(None, "user_version", RECORDER_DATABASE_VERSION)?;
+    transaction.commit()?;
+
+    info!(
+        tokens = migrated.len(),
+        "migrated recorder database from v5 to v6"
+    );
+    Ok(())
+}
+
 fn load_mutation_counts(connection: &Connection) -> Result<HashMap<String, usize>> {
     let mut statement =
         connection.prepare("SELECT token_id, COUNT(*) FROM pressure_log GROUP BY token_id")?;
@@ -510,17 +615,25 @@ fn load_mutation_counts(connection: &Connection) -> Result<HashMap<String, usize
 }
 
 fn decode_checkpoint(value: &[u8]) -> Result<PressureFrontierSnapshot> {
+    let json = decode_gzip_json(value)?;
+    let snapshot: PressureFrontierSnapshot =
+        serde_json::from_str(&json).context("parsing v6 pressure checkpoint JSON")?;
+    PressureFrontierMemory::restore(snapshot.clone())?;
+    Ok(snapshot)
+}
+
+fn decode_v5_checkpoint(value: &[u8]) -> Result<PressureFrontierMemory> {
+    let json = decode_gzip_json(value)?;
+    migrate_v5_checkpoint_json(&json)
+}
+
+fn decode_gzip_json(value: &[u8]) -> Result<String> {
     let mut decoder = GzDecoder::new(value);
     let mut json = String::new();
     decoder
         .read_to_string(&mut json)
         .context("decompressing pressure checkpoint")?;
-
-    let snapshot: PressureFrontierSnapshot =
-        serde_json::from_str(&json).context("parsing pressure checkpoint JSON")?;
-
-    PressureFrontierMemory::restore(snapshot.clone())?;
-    Ok(snapshot)
+    Ok(json)
 }
 
 fn encode_checkpoint(snapshot: &PressureFrontierSnapshot) -> Result<Vec<u8>> {
@@ -550,19 +663,19 @@ mod tests {
                     key: 5_000,
                     weight: 10.0,
                 }],
-                1_000.0,
+                1_000,
             )
             .unwrap();
         memory
     }
 
     #[test]
-    fn appends_mutations_then_atomically_replaces_with_checkpoint() {
+    fn appends_v6_mutations_then_atomically_replaces_with_checkpoint() {
         let temp = tempdir().unwrap();
         let store = RecorderStore::open(temp.path().join("recorder.sqlite")).unwrap();
 
         let mutation = RecorderPressureMutation::Update {
-            valid_through_ms: 2_000.0,
+            valid_through_ms: 2_000,
             changes: vec![PressureLevelChange {
                 price: 5_000,
                 shares: 4.0,
@@ -594,7 +707,10 @@ mod tests {
 
         assert_eq!(store.mutation_count("token").unwrap(), 0);
         let restored = store.load("token").unwrap().unwrap().pressure.unwrap();
-        assert_eq!(restored, memory.snapshot());
+        assert_eq!(
+            PressureFrontierMemory::restore(restored).unwrap(),
+            memory
+        );
         assert_eq!(store.stats().unwrap().pressure_log_mutations, 0);
     }
 }
