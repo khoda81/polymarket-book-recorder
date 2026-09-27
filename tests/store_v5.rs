@@ -2,14 +2,13 @@ use std::io::Write;
 
 use flate2::{Compression, write::GzEncoder};
 use polymarket_book_recorder::{
-    pressure::{FrontierLevel, PressureBand, PressureFrontierSnapshot, PressureLevelChange},
-    pressure_log::{RecorderPressureMutation, encode_pressure_mutation},
+    pressure::{FrontierLevel, PressureFrontierMemory},
     store::RecorderStore,
 };
 use rusqlite::{Connection, params};
 
 #[test]
-fn loads_v5_checkpoint_and_replays_binary_tail() {
+fn migrates_v5_checkpoint_and_tail_to_canonical_v6() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("recorder.sqlite");
 
@@ -38,13 +37,21 @@ fn loads_v5_checkpoint_and_replays_binary_tail() {
         )
         .unwrap();
 
+    // Deliberately contains the exact v5 pathology that motivated v6:
+    // a representable zero-width historical band.
     let checkpoint_json = r#"{
       "version":5,
       "current":[{"key":5000,"weight":10.0}],
       "field":{
         "maxPrice":10000,
         "currentValidThroughMs":1000.0,
-        "runs":[{"price":5000,"volume":10.0,"frozenBands":[]}]
+        "runs":[{
+          "price":5000,
+          "volume":10.000000000000002,
+          "frozenBands":[
+            {"loVolume":10.0,"hiVolume":10.0,"validThroughMs":500.0}
+          ]
+        }]
       }
     }"#;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -58,14 +65,7 @@ fn loads_v5_checkpoint_and_replays_binary_tail() {
         )
         .unwrap();
 
-    let mutation = encode_pressure_mutation(&RecorderPressureMutation::Update {
-        valid_through_ms: 2_000.0,
-        changes: vec![PressureLevelChange {
-            price: 5_000,
-            shares: 4.0,
-        }],
-    })
-    .unwrap();
+    let mutation = encode_v5_update(2_000.0, 5_000, 4.0);
     connection
         .execute(
             "INSERT INTO pressure_log(token_id,payload) VALUES (?1,?2)",
@@ -74,26 +74,56 @@ fn loads_v5_checkpoint_and_replays_binary_tail() {
         .unwrap();
     drop(connection);
 
+    // Opening the store performs the complete v5 -> v6 migration before the
+    // recorder sees any state.
     let store = RecorderStore::open(&path).unwrap();
     let record = store.load("token").unwrap().unwrap();
     assert_eq!(record.recording_since_ms, Some(900));
 
-    let snapshot: PressureFrontierSnapshot = record.pressure.unwrap();
+    let snapshot = record.pressure.unwrap();
+    let memory = PressureFrontierMemory::restore(snapshot.clone()).unwrap();
     assert_eq!(
-        snapshot.current,
+        memory.current_levels().unwrap(),
         vec![FrontierLevel {
             key: 5_000,
-            weight: 4.0
+            weight: 4.0,
         }]
     );
-    assert_eq!(snapshot.field.current_valid_through_ms, Some(2_000.0));
-    assert_eq!(snapshot.field.runs[0].volume, 4.0);
+
+    let json = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(json["version"], 6);
+    assert_eq!(json["state"]["kind"], "observed");
+    assert_eq!(json["state"]["validThroughMs"], 2_000);
+    assert_eq!(json["state"]["runs"][0]["volume"], 4.0);
     assert_eq!(
-        snapshot.field.runs[0].frozen_bands,
-        vec![PressureBand {
-            lo_volume: 4.0,
-            hi_volume: 10.0,
-            valid_through_ms: 1_000.0,
-        }]
+        json["state"]["runs"][0]["frozenSteps"][0]["hiVolume"],
+        10.0
     );
+    assert_eq!(
+        json["state"]["runs"][0]["frozenSteps"][0]["validThroughMs"],
+        1_000
+    );
+    assert!(json.to_string().find("loVolume").is_none());
+    assert!(json.get("current").is_none());
+
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let tail_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pressure_log", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
+    assert_eq!(tail_count, 0);
+}
+
+fn encode_v5_update(valid_through_ms: f64, price: u16, shares: f64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(21);
+    bytes.push(2); // MUTATION_UPDATE
+    bytes.extend_from_slice(&valid_through_ms.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&price.to_le_bytes());
+    bytes.extend_from_slice(&shares.to_le_bytes());
+    bytes
 }
