@@ -1,18 +1,26 @@
 use std::{
+    collections::HashMap,
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
-use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
-use rusqlite::{Connection, OptionalExtension};
+use anyhow::{Context, Result, bail, ensure};
+use flate2::{
+    Compression,
+    read::GzDecoder,
+    write::GzEncoder,
+};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::{
     pressure::{PressureFrontierMemory, PressureFrontierSnapshot},
-    pressure_log::{decode_pressure_mutation, replay_pressure_mutation},
+    pressure_log::{
+        RecorderPressureMutation, decode_pressure_mutation, encode_pressure_mutation,
+        replay_pressure_mutation,
+    },
 };
 
 pub const RECORDER_DATABASE_VERSION: i64 = 5;
@@ -33,6 +41,13 @@ impl RecorderTokenStatus {
             other => bail!("invalid recorder token status: {other}"),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Watched => "watched",
+            Self::Completed => "completed",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +66,30 @@ pub struct RecorderStoreRecord {
     pub pressure: Option<PressureFrontierSnapshot>,
 }
 
+#[derive(Debug, Clone)]
+pub enum RecorderCheckpointWrite {
+    Keep,
+    Replace(Option<PressureFrontierSnapshot>),
+}
+
+#[derive(Debug, Clone)]
+pub struct RecorderStoreWriteRecord {
+    pub token_id: String,
+    pub status: RecorderTokenStatus,
+    pub recording_since_ms: Option<i64>,
+    pub mutations: Vec<RecorderPressureMutation>,
+    pub checkpoint: RecorderCheckpointWrite,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecorderStoreWriteStats {
+    pub mutation_count: usize,
+    pub mutation_bytes: usize,
+    pub checkpoint_count: usize,
+    pub checkpoint_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecorderStoreStats {
@@ -61,9 +100,14 @@ pub struct RecorderStoreStats {
     pub database_path: String,
 }
 
+struct StoreInner {
+    connection: Connection,
+    mutation_counts: HashMap<String, usize>,
+}
+
 pub struct RecorderStore {
     path: PathBuf,
-    connection: Mutex<Connection>,
+    inner: Mutex<StoreInner>,
 }
 
 impl RecorderStore {
@@ -81,16 +125,20 @@ impl RecorderStore {
             .with_context(|| format!("opening recorder database {}", path.display()))?;
         configure_connection(&connection)?;
         initialize_database(&connection)?;
+        let mutation_counts = load_mutation_counts(&connection)?;
 
         Ok(Self {
             path,
-            connection: Mutex::new(connection),
+            inner: Mutex::new(StoreInner {
+                connection,
+                mutation_counts,
+            }),
         })
     }
 
     pub fn load_index(&self) -> Result<Vec<RecorderStoreIndexRecord>> {
-        let connection = self.lock()?;
-        let mut statement = connection.prepare(
+        let inner = self.lock()?;
+        let mut statement = inner.connection.prepare(
             r#"
             SELECT
                 s.token_id,
@@ -132,8 +180,9 @@ impl RecorderStore {
 
     pub fn load(&self, token_id: &str) -> Result<Option<RecorderStoreRecord>> {
         let (status, recording_since_ms, checkpoint, mutations) = {
-            let connection = self.lock()?;
-            let row = connection
+            let inner = self.lock()?;
+            let row = inner
+                .connection
                 .query_row(
                     r#"
                     SELECT status, recording_since_ms, pressure
@@ -155,7 +204,7 @@ impl RecorderStore {
                 return Ok(None);
             };
 
-            let mut statement = connection.prepare(
+            let mut statement = inner.connection.prepare(
                 r#"
                 SELECT payload
                 FROM pressure_log
@@ -193,11 +242,141 @@ impl RecorderStore {
         }))
     }
 
+    pub fn mutation_count(&self, token_id: &str) -> Result<usize> {
+        Ok(self
+            .lock()?
+            .mutation_counts
+            .get(token_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    pub fn should_checkpoint(&self, token_id: &str, additional_mutations: usize) -> Result<bool> {
+        Ok(self.mutation_count(token_id)? + additional_mutations >= RECORDER_CHECKPOINT_MUTATIONS)
+    }
+
+    pub fn write(&self, records: &[RecorderStoreWriteRecord]) -> Result<RecorderStoreWriteStats> {
+        struct EncodedRecord<'a> {
+            record: &'a RecorderStoreWriteRecord,
+            mutations: Vec<Vec<u8>>,
+            checkpoint: Option<Option<Vec<u8>>>,
+        }
+
+        let mut stats = RecorderStoreWriteStats::default();
+        let mut encoded = Vec::with_capacity(records.len());
+
+        for record in records {
+            let mutations = record
+                .mutations
+                .iter()
+                .map(encode_pressure_mutation)
+                .collect::<Result<Vec<_>>>()?;
+            stats.mutation_count += mutations.len();
+            stats.mutation_bytes += mutations.iter().map(Vec::len).sum::<usize>();
+
+            let checkpoint = match &record.checkpoint {
+                RecorderCheckpointWrite::Keep => None,
+                RecorderCheckpointWrite::Replace(snapshot) => {
+                    ensure!(
+                        mutations.is_empty(),
+                        "checkpoint replacement must already include its mutation tail"
+                    );
+                    stats.checkpoint_count += usize::from(snapshot.is_some());
+                    let compressed = snapshot.as_ref().map(encode_checkpoint).transpose()?;
+                    stats.checkpoint_bytes +=
+                        compressed.as_ref().map_or(0, Vec::len);
+                    Some(compressed)
+                }
+            };
+
+            encoded.push(EncodedRecord {
+                record,
+                mutations,
+                checkpoint,
+            });
+        }
+
+        let mut inner = self.lock()?;
+        let transaction = inner.connection.transaction()?;
+
+        for item in &encoded {
+            let record = item.record;
+            let pressure = item
+                .checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.as_deref());
+
+            if item.checkpoint.is_some() {
+                transaction.execute(
+                    r#"
+                    INSERT INTO token_state(
+                        token_id, status, recording_since_ms, pressure
+                    )
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(token_id) DO UPDATE SET
+                        status = excluded.status,
+                        recording_since_ms = excluded.recording_since_ms,
+                        pressure = excluded.pressure
+                    "#,
+                    params![
+                        record.token_id,
+                        record.status.as_str(),
+                        record.recording_since_ms,
+                        pressure,
+                    ],
+                )?;
+                transaction.execute(
+                    "DELETE FROM pressure_log WHERE token_id = ?1",
+                    [&record.token_id],
+                )?;
+            } else {
+                transaction.execute(
+                    r#"
+                    INSERT INTO token_state(
+                        token_id, status, recording_since_ms, pressure
+                    )
+                    VALUES (?1, ?2, ?3, NULL)
+                    ON CONFLICT(token_id) DO UPDATE SET
+                        status = excluded.status,
+                        recording_since_ms = excluded.recording_since_ms
+                    "#,
+                    params![
+                        record.token_id,
+                        record.status.as_str(),
+                        record.recording_since_ms,
+                    ],
+                )?;
+            }
+
+            for payload in &item.mutations {
+                transaction.execute(
+                    "INSERT INTO pressure_log(token_id, payload) VALUES (?1, ?2)",
+                    params![record.token_id, payload],
+                )?;
+            }
+        }
+
+        transaction.commit()?;
+
+        for item in encoded {
+            if item.checkpoint.is_some() {
+                inner.mutation_counts.remove(&item.record.token_id);
+            } else if !item.mutations.is_empty() {
+                *inner
+                    .mutation_counts
+                    .entry(item.record.token_id.clone())
+                    .or_default() += item.mutations.len();
+            }
+        }
+
+        Ok(stats)
+    }
+
     pub fn stats(&self) -> Result<RecorderStoreStats> {
-        let connection = self.lock()?;
-        let watched_tokens = count_where(&connection, "status = 'watched'")?;
-        let completed_tokens = count_where(&connection, "status = 'completed'")?;
-        let pressure_tokens = connection.query_row(
+        let inner = self.lock()?;
+        let watched_tokens = count_where(&inner.connection, "status = 'watched'")?;
+        let completed_tokens = count_where(&inner.connection, "status = 'completed'")?;
+        let pressure_tokens = inner.connection.query_row(
             r#"
             SELECT COUNT(*)
             FROM token_state s
@@ -212,9 +391,11 @@ impl RecorderStore {
             |row| row.get::<_, i64>(0),
         )? as u64;
         let pressure_log_mutations =
-            connection.query_row("SELECT COUNT(*) FROM pressure_log", [], |row| {
-                row.get::<_, i64>(0)
-            })? as u64;
+            inner
+                .connection
+                .query_row("SELECT COUNT(*) FROM pressure_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })? as u64;
 
         Ok(RecorderStoreStats {
             watched_tokens,
@@ -227,12 +408,13 @@ impl RecorderStore {
 
     pub fn checkpoint(&self) -> Result<()> {
         self.lock()?
+            .connection
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.connection
+    fn lock(&self) -> Result<MutexGuard<'_, StoreInner>> {
+        self.inner
             .lock()
             .map_err(|_| anyhow::anyhow!("recorder database mutex poisoned"))
     }
@@ -302,6 +484,22 @@ fn initialize_database(connection: &Connection) -> Result<()> {
     )
 }
 
+fn load_mutation_counts(connection: &Connection) -> Result<HashMap<String, usize>> {
+    let mut statement = connection.prepare(
+        "SELECT token_id, COUNT(*) FROM pressure_log GROUP BY token_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    let mut counts = HashMap::new();
+    for row in rows {
+        let (token_id, count) = row?;
+        counts.insert(token_id, usize::try_from(count)?);
+    }
+    Ok(counts)
+}
+
 fn decode_checkpoint(value: &[u8]) -> Result<PressureFrontierSnapshot> {
     let mut decoder = GzDecoder::new(value);
     let mut json = String::new();
@@ -312,13 +510,82 @@ fn decode_checkpoint(value: &[u8]) -> Result<PressureFrontierSnapshot> {
     let snapshot: PressureFrontierSnapshot =
         serde_json::from_str(&json).context("parsing pressure checkpoint JSON")?;
 
-    // Validate the exact v5 invariants while restoring. Return the canonical
-    // serde representation so callers can replay the mutation tail on top.
     PressureFrontierMemory::restore(snapshot.clone())?;
     Ok(snapshot)
+}
+
+fn encode_checkpoint(snapshot: &PressureFrontierSnapshot) -> Result<Vec<u8>> {
+    PressureFrontierMemory::restore(snapshot.clone())?;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    serde_json::to_writer(&mut encoder, snapshot).context("serializing pressure checkpoint")?;
+    encoder.finish().context("compressing pressure checkpoint")
 }
 
 fn count_where(connection: &Connection, predicate: &str) -> Result<u64> {
     let sql = format!("SELECT COUNT(*) FROM token_state WHERE {predicate}");
     Ok(connection.query_row(&sql, [], |row| row.get::<_, i64>(0))? as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pressure::{FrontierLevel, PressureLevelChange};
+    use tempfile::tempdir;
+
+    fn one_level_memory() -> PressureFrontierMemory {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[FrontierLevel {
+                    key: 5_000,
+                    weight: 10.0,
+                }],
+                1_000.0,
+            )
+            .unwrap();
+        memory
+    }
+
+    #[test]
+    fn appends_mutations_then_atomically_replaces_with_checkpoint() {
+        let temp = tempdir().unwrap();
+        let store = RecorderStore::open(temp.path().join("recorder.sqlite")).unwrap();
+
+        let mutation = RecorderPressureMutation::Update {
+            valid_through_ms: 2_000.0,
+            changes: vec![PressureLevelChange {
+                price: 5_000,
+                shares: 4.0,
+            }],
+        };
+
+        store
+            .write(&[RecorderStoreWriteRecord {
+                token_id: "token".into(),
+                status: RecorderTokenStatus::Watched,
+                recording_since_ms: Some(1_000),
+                mutations: vec![mutation.clone()],
+                checkpoint: RecorderCheckpointWrite::Keep,
+            }])
+            .unwrap();
+        assert_eq!(store.mutation_count("token").unwrap(), 1);
+
+        let mut memory = one_level_memory();
+        replay_pressure_mutation(&mut memory, mutation).unwrap();
+        store
+            .write(&[RecorderStoreWriteRecord {
+                token_id: "token".into(),
+                status: RecorderTokenStatus::Watched,
+                recording_since_ms: Some(1_000),
+                mutations: Vec::new(),
+                checkpoint: RecorderCheckpointWrite::Replace(Some(memory.snapshot())),
+            }])
+            .unwrap();
+
+        assert_eq!(store.mutation_count("token").unwrap(), 0);
+        let restored = store.load("token").unwrap().unwrap().pressure.unwrap();
+        assert_eq!(restored, memory.snapshot());
+        assert_eq!(store.stats().unwrap().pressure_log_mutations, 0);
+    }
 }
