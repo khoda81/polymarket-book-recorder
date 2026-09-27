@@ -341,10 +341,7 @@ impl AgeRecorder {
             }
             RecorderCommand::Stop { reply } => {
                 let result = self.shutdown().await;
-                let response = result
-                    .as_ref()
-                    .map(|_| ())
-                    .map_err(ToString::to_string);
+                let response = result.as_ref().map(|_| ()).map_err(ToString::to_string);
                 let _ = reply.send(response);
                 result?;
                 return Ok(true);
@@ -677,10 +674,7 @@ impl AgeRecorder {
         valid_through_ms: i64,
     ) -> Result<()> {
         self.ensure_memory(token_id)?;
-        let memory = self
-            .memories
-            .entry(token_id.to_owned())
-            .or_default();
+        let memory = self.memories.entry(token_id.to_owned()).or_default();
 
         let mut mutated = memory.update_levels(&changes, valid_through_ms as f64)?;
         if memory.observe_through(valid_through_ms as f64)? {
