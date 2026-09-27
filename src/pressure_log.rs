@@ -1,6 +1,6 @@
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 
-use crate::pressure::{FrontierLevel, PressureFrontierMemory, PressureLevelChange, PRICE_SCALE};
+use crate::pressure::{FrontierLevel, PRICE_SCALE, PressureFrontierMemory, PressureLevelChange};
 
 const MUTATION_CLEAR: u8 = 0;
 const MUTATION_REPLACE: u8 = 1;
@@ -26,10 +26,7 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
 
     let kind = value[0];
     if kind == MUTATION_CLEAR {
-        ensure!(
-            value.len() == 1,
-            "malformed clear pressure mutation"
-        );
+        ensure!(value.len() == 1, "malformed clear pressure mutation");
         return Ok(RecorderPressureMutation::Clear);
     }
 
@@ -62,9 +59,7 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
         let shares = f64::from_le_bytes(value[offset + 2..offset + 10].try_into()?);
         ensure!(price <= PRICE_SCALE, "price ticks must be in [0, 10000]");
         ensure!(
-            shares.is_finite()
-                && shares >= 0.0
-                && (kind != MUTATION_REPLACE || shares > 0.0),
+            shares.is_finite() && shares >= 0.0 && (kind != MUTATION_REPLACE || shares > 0.0),
             "invalid pressure mutation shares"
         );
         entries.push((price, shares));
@@ -99,7 +94,10 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
         } => (
             MUTATION_REPLACE,
             *valid_through_ms,
-            levels.iter().map(|level| (level.key, level.weight)).collect(),
+            levels
+                .iter()
+                .map(|level| (level.key, level.weight))
+                .collect(),
         ),
         RecorderPressureMutation::Update {
             valid_through_ms,
@@ -123,17 +121,15 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
         "too many pressure levels in one mutation"
     );
 
-    let mut bytes = Vec::with_capacity(MUTATION_HEADER_BYTES + entries.len() * MUTATION_LEVEL_BYTES);
+    let mut bytes =
+        Vec::with_capacity(MUTATION_HEADER_BYTES + entries.len() * MUTATION_LEVEL_BYTES);
     bytes.push(kind);
     bytes.extend_from_slice(&valid_through_ms.to_le_bytes());
     bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
 
     for (price, shares) in entries {
         ensure!(price <= PRICE_SCALE, "price ticks must be in [0, 10000]");
-        if !shares.is_finite()
-            || shares < 0.0
-            || (kind == MUTATION_REPLACE && shares <= 0.0)
-        {
+        if !shares.is_finite() || shares < 0.0 || (kind == MUTATION_REPLACE && shares <= 0.0) {
             bail!("invalid pressure mutation shares");
         }
         bytes.extend_from_slice(&price.to_le_bytes());
