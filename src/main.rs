@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
-use polymarket_book_recorder::{api, store::RecorderStore};
+use polymarket_book_recorder::{api, recorder, store::RecorderStore};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -27,17 +27,17 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(".data/age-recorder.sqlite"));
 
     let store = Arc::new(RecorderStore::open(&database_path)?);
-    let app = api::router(store.clone());
+    let runtime = recorder::start(store).await?;
+    let app = api::router(runtime.handle());
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
 
-    info!(port, database = %database_path.display(), "recorder compatibility server listening");
+    info!(port, database = %database_path.display(), "age recorder listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    store.checkpoint()?;
-    Ok(())
+    runtime.shutdown().await
 }
 
 async fn shutdown_signal() {

@@ -1,72 +1,32 @@
-use std::{collections::BTreeMap, sync::Arc};
-
 use axum::{
     Json, Router,
     extract::{RawQuery, State},
-    http::{Method, StatusCode, header},
+    http::{Method, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::{
-    pressure::PressureFrontierSnapshot,
-    store::{RecorderStore, RecorderStoreStats},
-};
+use crate::recorder::{RecorderHandle, RecorderStats};
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<RecorderStore>,
+    recorder: RecorderHandle,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HealthResponse {
-    watched_tokens: u64,
-    completed_tokens: u64,
-    hydrated_tokens: u64,
-    live_books: u64,
-    subscription_connections: u64,
-    subscription_batches: u64,
-    dirty_tokens: u64,
-    pending_pressure_mutations: u64,
-    pressure_tokens: u64,
-    pressure_log_mutations: u64,
-    database_path: String,
-    mode: &'static str,
-}
-
-impl From<RecorderStoreStats> for HealthResponse {
-    fn from(stats: RecorderStoreStats) -> Self {
-        Self {
-            watched_tokens: stats.watched_tokens,
-            completed_tokens: stats.completed_tokens,
-            hydrated_tokens: 0,
-            live_books: 0,
-            subscription_connections: 0,
-            subscription_batches: 0,
-            dirty_tokens: 0,
-            pending_pressure_mutations: 0,
-            pressure_tokens: stats.pressure_tokens,
-            pressure_log_mutations: stats.pressure_log_mutations,
-            database_path: stats.database_path,
-            mode: "v5-compatibility-reader",
-        }
-    }
+struct WatchRequest {
+    #[serde(default)]
+    token_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct TransportState {
-    pressure: PressureFrontierSnapshot,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StateResponse {
-    recording_since_ms_by_token: BTreeMap<String, i64>,
-    states: BTreeMap<String, TransportState>,
-    pending_token_ids: Vec<String>,
+struct WatchResponse {
+    changed: bool,
+    #[serde(flatten)]
+    stats: RecorderStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,7 +34,7 @@ struct ErrorBody {
     error: String,
 }
 
-pub fn router(store: Arc<RecorderStore>) -> Router {
+pub fn router(recorder: RecorderHandle) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -83,61 +43,34 @@ pub fn router(store: Arc<RecorderStore>) -> Router {
     Router::new()
         .route("/api/recorder/health", get(health))
         .route("/api/recorder/state", get(state))
-        .route("/api/recorder/watch", post(watch_not_yet_ported))
+        .route("/api/recorder/watch", post(watch))
         .layer(cors)
-        .with_state(AppState { store })
+        .with_state(AppState { recorder })
 }
 
-async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
-    Ok(Json(state.store.stats()?.into()))
+async fn health(State(state): State<AppState>) -> Result<Json<RecorderStats>, ApiError> {
+    Ok(Json(state.recorder.stats().await?))
 }
 
 async fn state(
     State(state): State<AppState>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<StateResponse>, ApiError> {
+) -> Result<Json<crate::recorder::RecorderStateResponse>, ApiError> {
     let query = StateQuery::parse(raw_query.as_deref());
-
-    let mut recording_since_ms_by_token = BTreeMap::new();
-    let mut states = BTreeMap::new();
-    let mut pending_token_ids = Vec::new();
-
-    for token_id in query.token_ids {
-        match state.store.load(&token_id)? {
-            Some(record) => {
-                if let (Some(since), Some(pressure)) = (record.recording_since_ms, record.pressure)
-                {
-                    recording_since_ms_by_token.insert(token_id.clone(), since);
-                    if !query.metadata_only {
-                        states.insert(token_id, TransportState { pressure });
-                    }
-                } else if matches!(record.status, crate::store::RecorderTokenStatus::Watched) {
-                    pending_token_ids.push(token_id);
-                }
-            }
-            None => {
-                // The live recorder will create/watch these once ingestion is
-                // ported. Until then, report the same useful frontend state:
-                // requested but not hydrated yet.
-                pending_token_ids.push(token_id);
-            }
-        }
-    }
-
-    Ok(Json(StateResponse {
-        recording_since_ms_by_token,
-        states,
-        pending_token_ids,
-    }))
+    Ok(Json(
+        state
+            .recorder
+            .state(query.token_ids, !query.metadata_only)
+            .await?,
+    ))
 }
 
-async fn watch_not_yet_ported() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorBody {
-            error: "live Polymarket ingestion is the next porting milestone".to_owned(),
-        }),
-    )
+async fn watch(
+    State(state): State<AppState>,
+    Json(body): Json<WatchRequest>,
+) -> Result<Json<WatchResponse>, ApiError> {
+    let (changed, stats) = state.recorder.watch(body.token_ids).await?;
+    Ok(Json(WatchResponse { changed, stats }))
 }
 
 #[derive(Debug, Default)]
@@ -192,7 +125,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         tracing::error!(error = ?self.0, "recorder request failed");
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorBody {
                 error: self.0.to_string(),
             }),
