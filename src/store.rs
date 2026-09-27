@@ -568,10 +568,7 @@ fn migrate_database_v5_to_v6(connection: &mut Connection) -> Result<()> {
             "UPDATE token_state SET pressure = ?1 WHERE token_id = ?2",
             params![checkpoint, token_id],
         )?;
-        transaction.execute(
-            "DELETE FROM pressure_log WHERE token_id = ?1",
-            [token_id],
-        )?;
+        transaction.execute("DELETE FROM pressure_log WHERE token_id = ?1", [token_id])?;
     }
 
     transaction.pragma_update(None, "user_version", RECORDER_DATABASE_VERSION)?;
