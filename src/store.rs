@@ -7,11 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use flate2::{
-    Compression,
-    read::GzDecoder,
-    write::GzEncoder,
-};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -283,8 +279,7 @@ impl RecorderStore {
                     );
                     stats.checkpoint_count += usize::from(snapshot.is_some());
                     let compressed = snapshot.as_ref().map(encode_checkpoint).transpose()?;
-                    stats.checkpoint_bytes +=
-                        compressed.as_ref().map_or(0, Vec::len);
+                    stats.checkpoint_bytes += compressed.as_ref().map_or(0, Vec::len);
                     Some(compressed)
                 }
             };
@@ -485,9 +480,8 @@ fn initialize_database(connection: &Connection) -> Result<()> {
 }
 
 fn load_mutation_counts(connection: &Connection) -> Result<HashMap<String, usize>> {
-    let mut statement = connection.prepare(
-        "SELECT token_id, COUNT(*) FROM pressure_log GROUP BY token_id",
-    )?;
+    let mut statement =
+        connection.prepare("SELECT token_id, COUNT(*) FROM pressure_log GROUP BY token_id")?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
