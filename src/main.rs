@@ -1,13 +1,32 @@
-use std::{env, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use clap::Parser;
 use polymarket_book_recorder::{api, recorder, store::RecorderStore};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "polymarket-book-recorder",
+    version,
+    about = "Continuously record Polymarket order-book pressure history"
+)]
+struct Args {
+    /// SQLite recorder database.
+    #[arg(long, default_value = ".data/age-recorder.sqlite")]
+    database: PathBuf,
+
+    /// HTTP API port.
+    #[arg(long, default_value_t = 3001)]
+    port: u16,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -15,23 +34,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let port = env::var("RECORDER_PORT")
-        .ok()
-        .map(|value| value.parse::<u16>())
-        .transpose()
-        .context("RECORDER_PORT must be a valid TCP port")?
-        .unwrap_or(3001);
-
-    let database_path = env::var_os("RECORDER_DB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".data/age-recorder.sqlite"));
-
-    let store = Arc::new(RecorderStore::open(&database_path)?);
+    let store = Arc::new(RecorderStore::open(&args.database)?);
     let runtime = recorder::start(store).await?;
     let app = api::router(runtime.handle());
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
 
-    info!(port, database = %database_path.display(), "age recorder listening");
+    info!(port = args.port, database = %args.database.display(), "age recorder listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

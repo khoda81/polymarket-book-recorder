@@ -218,7 +218,8 @@ pub struct PressureFrontierMemory {
 }
 
 impl PressureFrontierMemory {
-    pub fn restore(snapshot: PressureFrontierSnapshot) -> Result<Self> {
+    pub fn restore(mut snapshot: PressureFrontierSnapshot) -> Result<Self> {
+        canonicalize_snapshot(&mut snapshot);
         validate_snapshot(&snapshot)?;
 
         let current = snapshot
@@ -351,6 +352,17 @@ impl PressureFrontierMemory {
             "pressure frontier timestamp must be finite"
         );
         Ok(self.last_update_ms.map_or(value, |last| value.max(last)))
+    }
+}
+
+fn canonicalize_snapshot(snapshot: &mut PressureFrontierSnapshot) {
+    for run in &mut snapshot.field.runs {
+        run.frozen_bands.retain(|band| {
+            !(band.lo_volume.is_finite()
+                && band.hi_volume.is_finite()
+                && band.lo_volume >= 0.0
+                && same_volume(band.lo_volume, band.hi_volume))
+        });
     }
 }
 
@@ -603,6 +615,47 @@ fn volume_tolerance(a: f64, b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_discards_numerically_empty_frozen_bands() {
+        let snapshot = PressureFrontierSnapshot {
+            version: SNAPSHOT_VERSION,
+            current: vec![FrontierLevel {
+                key: 5_000,
+                weight: 4.0,
+            }],
+            field: PressureFieldSnapshot {
+                max_price: PRICE_SCALE,
+                current_valid_through_ms: Some(3_000.0),
+                runs: vec![PressureRun {
+                    price: 5_000,
+                    volume: 4.0,
+                    frozen_bands: vec![
+                        PressureBand {
+                            lo_volume: 10.0,
+                            hi_volume: 10.0,
+                            valid_through_ms: 1_000.0,
+                        },
+                        PressureBand {
+                            lo_volume: 4.0,
+                            hi_volume: 10.0,
+                            valid_through_ms: 2_000.0,
+                        },
+                    ],
+                }],
+            },
+        };
+
+        let restored = PressureFrontierMemory::restore(snapshot).unwrap();
+        assert_eq!(
+            restored.snapshot().field.runs[0].frozen_bands,
+            vec![PressureBand {
+                lo_volume: 4.0,
+                hi_volume: 10.0,
+                valid_through_ms: 2_000.0,
+            }]
+        );
+    }
 
     #[test]
     fn falling_frontier_freezes_previous_pressure() {

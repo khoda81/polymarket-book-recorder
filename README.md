@@ -30,14 +30,19 @@ state does not need shared locks.
 
 ## Run
 
-By default the service uses:
-
-    RECORDER_DB_PATH=.data/age-recorder.sqlite
-    RECORDER_PORT=3001
+By default the service uses `.data/age-recorder.sqlite` and port `3001`.
 
 Run a release build with:
 
     cargo run --release
+
+Or choose them explicitly:
+
+    cargo run --release -- --database .data/rust-recorder.sqlite --port 3002
+
+See all CLI options with:
+
+    cargo run --release -- --help
 
 ## Side-by-side validation against the TypeScript recorder
 
@@ -45,7 +50,7 @@ Do not point both recorder processes at the same SQLite file. Make a copy of the
 current database and run Rust on another port:
 
     cp ../polymarket-book-vis/.data/age-recorder.sqlite .data/rust-recorder.sqlite
-    RECORDER_DB_PATH=.data/rust-recorder.sqlite RECORDER_PORT=3002 cargo run --release
+    cargo run --release -- --database .data/rust-recorder.sqlite --port 3002
 
 Keep the TypeScript recorder on port 3001. Ask both recorders to watch the same
 tokens, then compare their state responses:
