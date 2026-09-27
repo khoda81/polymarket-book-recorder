@@ -13,8 +13,9 @@ v6 atomically before the recorder starts.
   continuity invalidation
 - exact integer price ticks
 - token-local ask-book pressure tracking
-- v6 pressure history as current cumulative volumes + frozen upper-edge steps
-- no persisted lower band edges and no duplicated current frontier
+- v6 pressure history as exact per-price current shares + frozen cumulative upper-edge steps
+- cumulative current pressure is derived by prefix sum; lower historical edges are implicit
+- no duplicated current frontier and no persisted lower band edges
 - SQLite schema version 6 with automatic v5 -> v6 migration
 - gzip-compressed pressure checkpoints
 - compact binary pressure mutation tails with integer millisecond timestamps
