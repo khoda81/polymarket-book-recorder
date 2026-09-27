@@ -523,10 +523,12 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
                     "run[{run_index}].frozenSteps must be strictly high-to-low"
                 );
             }
-            ensure!(
-                previous_time != Some(step.valid_through_ms),
-                "run[{run_index}].adjacent frozen steps with the same timestamp must be merged"
-            );
+            if let Some(previous_time) = previous_time {
+                ensure!(
+                    step.valid_through_ms > previous_time,
+                    "run[{run_index}].frozenSteps timestamps must increase from high to low"
+                );
+            }
 
             previous_hi = Some(step.hi_volume);
             previous_time = Some(step.valid_through_ms);
@@ -919,6 +921,63 @@ mod tests {
                 valid_through_ms: 2_000,
             }]
         );
+    }
+
+    #[test]
+    fn randomized_updates_keep_run_volumes_equivalent_to_exact_levels() {
+        let mut memory = PressureFrontierMemory::default();
+        let mut reference = BTreeMap::<u16, f64>::new();
+        let mut seed = 0x5eed_cafe_u64;
+
+        for step in 1..=2_000_i64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let price = (((seed >> 24) % 100) as u16 + 1) * 100;
+
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let shares = if seed % 7 == 0 {
+                0.0
+            } else {
+                ((seed >> 20) % 10_000) as f64 / 10.0 + 0.1
+            };
+
+            if shares == 0.0 {
+                reference.remove(&price);
+            } else {
+                reference.insert(price, shares);
+            }
+
+            memory
+                .update_levels(
+                    &[PressureLevelChange { price, shares }],
+                    step * 10,
+                )
+                .unwrap();
+
+            let actual = memory
+                .current_levels()
+                .unwrap()
+                .into_iter()
+                .map(|level| (level.key, level.weight))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(actual.len(), reference.len());
+            for (&price, &expected) in &reference {
+                assert!(
+                    same_volume(actual[&price], expected),
+                    "price={price} expected={expected} actual={}",
+                    actual[&price]
+                );
+            }
+
+            if step % 100 == 0 {
+                let restored =
+                    PressureFrontierMemory::restore(memory.snapshot()).unwrap();
+                assert_eq!(restored, memory);
+            }
+        }
     }
 
     #[test]
