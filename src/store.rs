@@ -496,17 +496,16 @@ fn initialize_database(connection: &mut Connection) -> Result<()> {
 }
 
 fn migrate_database_v5_to_v6(connection: &mut Connection) -> Result<()> {
-    #[derive(Debug)]
-    struct LegacyRecord {
-        token_id: String,
-        checkpoint: Option<Vec<u8>>,
-        mutations: Vec<(i64, Vec<u8>)>,
-    }
+    let transaction = connection.transaction()?;
 
-    let token_rows = {
-        let mut statement = connection.prepare(
+    // Keep migration memory bounded: only token IDs are collected globally.
+    // Each checkpoint + mutation tail is decoded, canonicalized, and replaced
+    // before moving to the next token. The surrounding transaction still makes
+    // the database-wide v5 -> v6 cutover atomic.
+    let token_ids = {
+        let mut statement = transaction.prepare(
             r#"
-            SELECT token_id, pressure
+            SELECT token_id
             FROM token_state s
             WHERE s.pressure IS NOT NULL
                OR EXISTS (
@@ -517,18 +516,23 @@ fn migrate_database_v5_to_v6(connection: &mut Connection) -> Result<()> {
             ORDER BY token_id
             "#,
         )?;
-
         statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
-            })?
+            .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    let mut legacy_records = Vec::with_capacity(token_rows.len());
-    for (token_id, checkpoint) in token_rows {
+    for token_id in &token_ids {
+        let checkpoint = transaction
+            .query_row(
+                "SELECT pressure FROM token_state WHERE token_id = ?1",
+                [token_id],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten();
+
         let mutations = {
-            let mut statement = connection.prepare(
+            let mut statement = transaction.prepare(
                 r#"
                 SELECT seq, payload
                 FROM pressure_log
@@ -537,61 +541,44 @@ fn migrate_database_v5_to_v6(connection: &mut Connection) -> Result<()> {
                 "#,
             )?;
             statement
-                .query_map([&token_id], |row| {
+                .query_map([token_id], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
-        legacy_records.push(LegacyRecord {
-            token_id,
-            checkpoint,
-            mutations,
-        });
-    }
 
-    let mut migrated = Vec::<(String, Vec<u8>)>::with_capacity(legacy_records.len());
-    for record in legacy_records {
-        let mut memory = match record.checkpoint {
+        let mut memory = match checkpoint {
             Some(checkpoint) => decode_v5_checkpoint(&checkpoint).with_context(|| {
-                format!(
-                    "migrating v5 pressure checkpoint for token {}",
-                    record.token_id
-                )
+                format!("migrating v5 pressure checkpoint for token {token_id}")
             })?,
             None => PressureFrontierMemory::default(),
         };
 
-        for (seq, payload) in record.mutations {
+        for (seq, payload) in mutations {
             let mutation = decode_v5_pressure_mutation(&payload).with_context(|| {
-                format!(
-                    "decoding v5 pressure mutation seq={seq} token={}",
-                    record.token_id
-                )
+                format!("decoding v5 pressure mutation seq={seq} token={token_id}")
             })?;
             replay_pressure_mutation(&mut memory, mutation).with_context(|| {
-                format!(
-                    "replaying v5 pressure mutation seq={seq} token={}",
-                    record.token_id
-                )
+                format!("replaying v5 pressure mutation seq={seq} token={token_id}")
             })?;
         }
 
-        migrated.push((record.token_id, encode_checkpoint(&memory.snapshot())?));
-    }
-
-    let transaction = connection.transaction()?;
-    for (token_id, checkpoint) in &migrated {
+        let checkpoint = encode_checkpoint(&memory.snapshot())?;
         transaction.execute(
             "UPDATE token_state SET pressure = ?1 WHERE token_id = ?2",
             params![checkpoint, token_id],
         )?;
+        transaction.execute(
+            "DELETE FROM pressure_log WHERE token_id = ?1",
+            [token_id],
+        )?;
     }
-    transaction.execute("DELETE FROM pressure_log", [])?;
+
     transaction.pragma_update(None, "user_version", RECORDER_DATABASE_VERSION)?;
     transaction.commit()?;
 
     info!(
-        tokens = migrated.len(),
+        tokens = token_ids.len(),
         "migrated recorder database from v5 to v6"
     );
     Ok(())
