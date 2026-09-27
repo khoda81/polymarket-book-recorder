@@ -202,20 +202,26 @@ impl RecorderStore {
 
             let mut statement = inner.connection.prepare(
                 r#"
-                SELECT payload
+                SELECT seq, payload
                 FROM pressure_log
                 WHERE token_id = ?1
                 ORDER BY seq
                 "#,
             )?;
             let mutations = statement
-                .query_map([token_id], |row| row.get::<_, Vec<u8>>(0))?
+                .query_map([token_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             (status, recording_since_ms, checkpoint, mutations)
         };
 
-        let mut pressure = checkpoint.as_deref().map(decode_checkpoint).transpose()?;
+        let mut pressure = checkpoint
+            .as_deref()
+            .map(decode_checkpoint)
+            .transpose()
+            .with_context(|| format!("restoring pressure checkpoint for token {token_id}"))?;
 
         if !mutations.is_empty() {
             let mut memory = match pressure.take() {
@@ -223,11 +229,20 @@ impl RecorderStore {
                 None => PressureFrontierMemory::default(),
             };
 
-            for payload in mutations {
-                let mutation = decode_pressure_mutation(&payload)?;
-                replay_pressure_mutation(&mut memory, mutation)?;
+            for (seq, payload) in mutations {
+                let mutation = decode_pressure_mutation(&payload).with_context(|| {
+                    format!("decoding pressure mutation seq={seq} token={token_id}")
+                })?;
+                replay_pressure_mutation(&mut memory, mutation).with_context(|| {
+                    format!("replaying pressure mutation seq={seq} token={token_id}")
+                })?;
             }
-            pressure = Some(memory.snapshot());
+
+            let snapshot = memory.snapshot();
+            PressureFrontierMemory::restore(snapshot.clone()).with_context(|| {
+                format!("validating replayed pressure state for token {token_id}")
+            })?;
+            pressure = Some(snapshot);
         }
 
         Ok(Some(RecorderStoreRecord {

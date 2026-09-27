@@ -137,9 +137,6 @@ impl MaterializedPressureField {
             }
 
             if index < first_run || same_volume(cumulative, run.volume) {
-                if index >= first_run {
-                    run.volume = cumulative;
-                }
                 continue;
             }
 
@@ -434,20 +431,27 @@ fn validate_field_snapshot(field: &PressureFieldSnapshot) -> Result<()> {
 fn validate_frozen_bands(run: &PressureRun) -> Result<()> {
     let mut lower_edge: Option<f64> = None;
 
-    for band in &run.frozen_bands {
+    for (index, band) in run.frozen_bands.iter().enumerate() {
         ensure!(
             band.lo_volume.is_finite()
                 && band.hi_volume.is_finite()
                 && band.valid_through_ms.is_finite()
                 && band.lo_volume >= 0.0
                 && band.hi_volume > band.lo_volume,
-            "invalid frozen pressure band"
+            "invalid frozen pressure band at price={} index={index}: lo={} hi={} validThroughMs={}",
+            run.price,
+            band.lo_volume,
+            band.hi_volume,
+            band.valid_through_ms,
         );
 
         if let Some(edge) = lower_edge {
             ensure!(
                 same_volume(edge, band.hi_volume),
-                "frozen pressure bands must be contiguous"
+                "frozen pressure bands must be contiguous at price={} index={index}: previousLo={} nextHi={}",
+                run.price,
+                edge,
+                band.hi_volume,
             );
         }
         lower_edge = Some(band.lo_volume);
@@ -456,7 +460,10 @@ fn validate_frozen_bands(run: &PressureRun) -> Result<()> {
     if let Some(edge) = lower_edge {
         ensure!(
             same_volume(edge, run.volume),
-            "frozen pressure bands must touch the current volume frontier"
+            "frozen pressure bands must touch the current volume frontier at price={}: bandLo={} runVolume={}",
+            run.price,
+            edge,
+            run.volume,
         );
     }
 
