@@ -652,7 +652,7 @@ impl AgeRecorder {
         self.ensure_memory(token_id)?;
         let memory = self.memories.entry(token_id.to_owned()).or_default();
 
-        if !memory.observe_levels(&levels, valid_through_ms as f64)? {
+        if !memory.observe_levels(&levels, valid_through_ms)? {
             return Ok(());
         }
 
@@ -660,7 +660,7 @@ impl AgeRecorder {
             .entry(token_id.to_owned())
             .or_default()
             .push(RecorderPressureMutation::Replace {
-                valid_through_ms: valid_through_ms as f64,
+                valid_through_ms,
                 levels,
             });
         self.finish_memory_update(token_id, valid_through_ms);
@@ -676,8 +676,8 @@ impl AgeRecorder {
         self.ensure_memory(token_id)?;
         let memory = self.memories.entry(token_id.to_owned()).or_default();
 
-        let mut mutated = memory.update_levels(&changes, valid_through_ms as f64)?;
-        if memory.observe_through(valid_through_ms as f64)? {
+        let mut mutated = memory.update_levels(&changes, valid_through_ms)?;
+        if memory.observe_through(valid_through_ms)? {
             mutated = true;
         }
         if !mutated {
@@ -688,7 +688,7 @@ impl AgeRecorder {
             .entry(token_id.to_owned())
             .or_default()
             .push(RecorderPressureMutation::Update {
-                valid_through_ms: valid_through_ms as f64,
+                valid_through_ms,
                 changes,
             });
         self.finish_memory_update(token_id, valid_through_ms);
