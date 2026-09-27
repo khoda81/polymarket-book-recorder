@@ -5,9 +5,9 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::{
@@ -69,7 +69,10 @@ pub struct RecorderStore {
 impl RecorderStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating database directory {}", parent.display()))?;
         }
@@ -167,10 +170,7 @@ impl RecorderStore {
             (status, recording_since_ms, checkpoint, mutations)
         };
 
-        let mut pressure = checkpoint
-            .as_deref()
-            .map(decode_checkpoint)
-            .transpose()?;
+        let mut pressure = checkpoint.as_deref().map(decode_checkpoint).transpose()?;
 
         if !mutations.is_empty() {
             let mut memory = match pressure.take() {
@@ -211,11 +211,10 @@ impl RecorderStore {
             [],
             |row| row.get::<_, u64>(0),
         )?;
-        let pressure_log_mutations = connection.query_row(
-            "SELECT COUNT(*) FROM pressure_log",
-            [],
-            |row| row.get::<_, u64>(0),
-        )?;
+        let pressure_log_mutations =
+            connection.query_row("SELECT COUNT(*) FROM pressure_log", [], |row| {
+                row.get::<_, u64>(0)
+            })?;
 
         Ok(RecorderStoreStats {
             watched_tokens,
@@ -227,7 +226,8 @@ impl RecorderStore {
     }
 
     pub fn checkpoint(&self) -> Result<()> {
-        self.lock()?.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+        self.lock()?
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
 
