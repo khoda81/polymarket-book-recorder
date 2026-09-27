@@ -1,25 +1,66 @@
 # polymarket-book-recorder
 
-Rust rewrite of the Polymarket Viz recorder.
+Rust recorder backend for [Polymarket Viz](https://github.com/khoda81/polymarket-book-vis).
 
-The first compatibility milestone intentionally preserves the existing recorder contract instead of redesigning storage:
+The rewrite deliberately preserves the existing recorder contract and persisted
+format so the Rust and TypeScript implementations can be tested against one
+another before cutover.
 
+## What is ported
+
+- Polymarket CLOB REST book seeding
+- Polymarket market WebSocket subscriptions, heartbeat, reconnect, and
+  continuity invalidation
+- exact integer price ticks
+- token-local ask-book pressure tracking
+- pressure frontier / frozen-band history
 - SQLite schema version 5
 - gzip-compressed pressure frontier checkpoints
 - compact binary pressure mutation tails
-- checkpoint + tail replay into the canonical pressure snapshot
-- compatible GET /api/recorder/health and GET /api/recorder/state endpoints
+- checkpoint + tail replay
+- incremental writeback with a checkpoint every 512 mutations
+- `GET /api/recorder/health`
+- `GET /api/recorder/state`
+- `POST /api/recorder/watch`
+- graceful SIGINT/SIGTERM flush
 
-Live Polymarket ingestion is the next milestone. POST /api/recorder/watch currently returns 501 rather than pretending a token is being recorded.
+The recorder owns mutable market state in one Tokio actor. WebSocket shards and
+REST seed requests feed that actor through channels, so the hot book/pressure
+state does not need shared locks.
 
-## Run against the existing database
+## Run
 
-Set RECORDER_DB_PATH to a copy of the current age-recorder.sqlite and run:
+By default the service uses:
+
+    RECORDER_DB_PATH=.data/age-recorder.sqlite
+    RECORDER_PORT=3001
+
+Run a release build with:
 
     cargo run --release
 
-The server listens on port 3001 by default. RECORDER_PORT overrides it.
+## Side-by-side validation against the TypeScript recorder
 
-## Compatibility strategy
+Do not point both recorder processes at the same SQLite file. Make a copy of the
+current database and run Rust on another port:
 
-The TypeScript recorder remains the differential oracle until the Rust service can consume the same live feed and produce equivalent snapshots. The Rust port reads the existing database directly; there is no migration step.
+    cp ../polymarket-book-vis/.data/age-recorder.sqlite .data/rust-recorder.sqlite
+    RECORDER_DB_PATH=.data/rust-recorder.sqlite RECORDER_PORT=3002 cargo run --release
+
+Keep the TypeScript recorder on port 3001. Ask both recorders to watch the same
+tokens, then compare their state responses:
+
+    curl -X POST http://127.0.0.1:3001/api/recorder/watch \
+      -H 'content-type: application/json' \
+      -d '{"tokenIds":["TOKEN_ID"]}'
+
+    curl -X POST http://127.0.0.1:3002/api/recorder/watch \
+      -H 'content-type: application/json' \
+      -d '{"tokenIds":["TOKEN_ID"]}'
+
+    curl 'http://127.0.0.1:3001/api/recorder/state?tokenId=TOKEN_ID'
+    curl 'http://127.0.0.1:3002/api/recorder/state?tokenId=TOKEN_ID'
+
+The TypeScript recorder remains the differential oracle until live state and
+restart behavior agree under real traffic. No database migration is required:
+the Rust recorder reads and writes the same v5 format.
