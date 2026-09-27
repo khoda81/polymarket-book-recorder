@@ -11,82 +11,26 @@ const MUTATION_LEVEL_BYTES: usize = 10;
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecorderPressureMutation {
     Replace {
-        valid_through_ms: f64,
+        valid_through_ms: i64,
         levels: Vec<FrontierLevel>,
     },
     Update {
-        valid_through_ms: f64,
+        valid_through_ms: i64,
         changes: Vec<PressureLevelChange>,
     },
     Clear,
 }
 
 pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation> {
-    ensure!(!value.is_empty(), "empty pressure mutation");
+    decode_pressure_mutation_with_timestamp(value, TimestampEncoding::V6Integer)
+}
 
-    let kind = value[0];
-    if kind == MUTATION_CLEAR {
-        ensure!(value.len() == 1, "malformed clear pressure mutation");
-        return Ok(RecorderPressureMutation::Clear);
-    }
-
-    ensure!(
-        kind == MUTATION_REPLACE || kind == MUTATION_UPDATE,
-        "unsupported pressure mutation kind: {kind}"
-    );
-    ensure!(
-        value.len() >= MUTATION_HEADER_BYTES,
-        "truncated pressure mutation"
-    );
-
-    let valid_through_ms = f64::from_le_bytes(value[1..9].try_into()?);
-    ensure!(
-        valid_through_ms.is_finite(),
-        "pressure mutation timestamp must be finite"
-    );
-
-    let count = u16::from_le_bytes(value[9..11].try_into()?) as usize;
-    let expected = MUTATION_HEADER_BYTES + count * MUTATION_LEVEL_BYTES;
-    ensure!(
-        value.len() == expected,
-        "pressure mutation has invalid length"
-    );
-
-    let mut entries = Vec::with_capacity(count);
-    let mut offset = MUTATION_HEADER_BYTES;
-    for _ in 0..count {
-        let price = u16::from_le_bytes(value[offset..offset + 2].try_into()?);
-        let shares = f64::from_le_bytes(value[offset + 2..offset + 10].try_into()?);
-        ensure!(price <= PRICE_SCALE, "price ticks must be in [0, 10000]");
-        ensure!(
-            shares.is_finite() && shares >= 0.0 && (kind != MUTATION_REPLACE || shares > 0.0),
-            "invalid pressure mutation shares"
-        );
-        entries.push((price, shares));
-        offset += MUTATION_LEVEL_BYTES;
-    }
-
-    Ok(if kind == MUTATION_REPLACE {
-        RecorderPressureMutation::Replace {
-            valid_through_ms,
-            levels: entries
-                .into_iter()
-                .map(|(key, weight)| FrontierLevel { key, weight })
-                .collect(),
-        }
-    } else {
-        RecorderPressureMutation::Update {
-            valid_through_ms,
-            changes: entries
-                .into_iter()
-                .map(|(price, shares)| PressureLevelChange { price, shares })
-                .collect(),
-        }
-    })
+pub(crate) fn decode_v5_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation> {
+    decode_pressure_mutation_with_timestamp(value, TimestampEncoding::V5Float)
 }
 
 pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<Vec<u8>> {
-    let (kind, valid_through_ms, entries): (u8, f64, Vec<(u16, f64)>) = match mutation {
+    let (kind, valid_through_ms, entries): (u8, i64, Vec<(u16, f64)>) = match mutation {
         RecorderPressureMutation::Clear => return Ok(vec![MUTATION_CLEAR]),
         RecorderPressureMutation::Replace {
             valid_through_ms,
@@ -113,8 +57,8 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
     };
 
     ensure!(
-        valid_through_ms.is_finite(),
-        "pressure mutation timestamp must be finite"
+        valid_through_ms >= 0,
+        "pressure mutation timestamp must be non-negative"
     );
     ensure!(
         entries.len() <= u16::MAX as usize,
@@ -162,6 +106,92 @@ pub fn replay_pressure_mutation(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TimestampEncoding {
+    V5Float,
+    V6Integer,
+}
+
+fn decode_pressure_mutation_with_timestamp(
+    value: &[u8],
+    timestamp_encoding: TimestampEncoding,
+) -> Result<RecorderPressureMutation> {
+    ensure!(!value.is_empty(), "empty pressure mutation");
+
+    let kind = value[0];
+    if kind == MUTATION_CLEAR {
+        ensure!(value.len() == 1, "malformed clear pressure mutation");
+        return Ok(RecorderPressureMutation::Clear);
+    }
+
+    ensure!(
+        kind == MUTATION_REPLACE || kind == MUTATION_UPDATE,
+        "unsupported pressure mutation kind: {kind}"
+    );
+    ensure!(
+        value.len() >= MUTATION_HEADER_BYTES,
+        "truncated pressure mutation"
+    );
+
+    let valid_through_ms = match timestamp_encoding {
+        TimestampEncoding::V6Integer => {
+            let value = i64::from_le_bytes(value[1..9].try_into()?);
+            ensure!(
+                value >= 0,
+                "pressure mutation timestamp must be non-negative"
+            );
+            value
+        }
+        TimestampEncoding::V5Float => {
+            let value = f64::from_le_bytes(value[1..9].try_into()?);
+            ensure!(
+                value.is_finite() && value >= 0.0 && value <= i64::MAX as f64,
+                "v5 pressure mutation timestamp is invalid"
+            );
+            value.trunc() as i64
+        }
+    };
+
+    let count = u16::from_le_bytes(value[9..11].try_into()?) as usize;
+    let expected = MUTATION_HEADER_BYTES + count * MUTATION_LEVEL_BYTES;
+    ensure!(
+        value.len() == expected,
+        "pressure mutation has invalid length"
+    );
+
+    let mut entries = Vec::with_capacity(count);
+    let mut offset = MUTATION_HEADER_BYTES;
+    for _ in 0..count {
+        let price = u16::from_le_bytes(value[offset..offset + 2].try_into()?);
+        let shares = f64::from_le_bytes(value[offset + 2..offset + 10].try_into()?);
+        ensure!(price <= PRICE_SCALE, "price ticks must be in [0, 10000]");
+        ensure!(
+            shares.is_finite() && shares >= 0.0 && (kind != MUTATION_REPLACE || shares > 0.0),
+            "invalid pressure mutation shares"
+        );
+        entries.push((price, shares));
+        offset += MUTATION_LEVEL_BYTES;
+    }
+
+    Ok(if kind == MUTATION_REPLACE {
+        RecorderPressureMutation::Replace {
+            valid_through_ms,
+            levels: entries
+                .into_iter()
+                .map(|(key, weight)| FrontierLevel { key, weight })
+                .collect(),
+        }
+    } else {
+        RecorderPressureMutation::Update {
+            valid_through_ms,
+            changes: entries
+                .into_iter()
+                .map(|(price, shares)| PressureLevelChange { price, shares })
+                .collect(),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,9 +210,9 @@ mod tests {
     }
 
     #[test]
-    fn mutation_round_trip_matches_v5_layout() {
+    fn v6_mutation_uses_integer_timestamp() {
         let mutation = RecorderPressureMutation::Update {
-            valid_through_ms: 1_234.5,
+            valid_through_ms: 1_234,
             changes: vec![
                 PressureLevelChange {
                     price: 125,
@@ -197,11 +227,32 @@ mod tests {
 
         let encoded = encode_pressure_mutation(&mutation).unwrap();
         assert_eq!(encoded[0], MUTATION_UPDATE);
-        assert_eq!(&encoded[1..9], &1_234.5_f64.to_le_bytes());
+        assert_eq!(&encoded[1..9], &1_234_i64.to_le_bytes());
         assert_eq!(&encoded[9..11], &2_u16.to_le_bytes());
         assert_eq!(&encoded[11..13], &125_u16.to_le_bytes());
         assert_eq!(&encoded[13..21], &12.5_f64.to_le_bytes());
 
         assert_eq!(decode_pressure_mutation(&encoded).unwrap(), mutation);
+    }
+
+    #[test]
+    fn v5_float_timestamp_decoder_is_migration_only() {
+        let mut encoded = Vec::new();
+        encoded.push(MUTATION_UPDATE);
+        encoded.extend_from_slice(&1_234.0_f64.to_le_bytes());
+        encoded.extend_from_slice(&1_u16.to_le_bytes());
+        encoded.extend_from_slice(&5_000_u16.to_le_bytes());
+        encoded.extend_from_slice(&4.0_f64.to_le_bytes());
+
+        assert_eq!(
+            decode_v5_pressure_mutation(&encoded).unwrap(),
+            RecorderPressureMutation::Update {
+                valid_through_ms: 1_234,
+                changes: vec![PressureLevelChange {
+                    price: 5_000,
+                    shares: 4.0,
+                }],
+            }
+        );
     }
 }
