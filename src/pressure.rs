@@ -502,7 +502,7 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
             "edge pressure must be non-decreasing in price"
         );
 
-        let mut previous_hi = f64::INFINITY;
+        let mut previous_hi: Option<f64> = None;
         let mut previous_time: Option<i64> = None;
         for (step_index, step) in run.frozen_steps.iter().enumerate() {
             ensure!(
@@ -517,16 +517,18 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
                 step.hi_volume > run.volume && !same_volume(step.hi_volume, run.volume),
                 "run[{run_index}].frozenSteps[{step_index}] must sit above current volume"
             );
-            ensure!(
-                step.hi_volume < previous_hi && !same_volume(step.hi_volume, previous_hi),
-                "run[{run_index}].frozenSteps must be strictly high-to-low"
-            );
+            if let Some(previous_hi) = previous_hi {
+                ensure!(
+                    step.hi_volume < previous_hi && !same_volume(step.hi_volume, previous_hi),
+                    "run[{run_index}].frozenSteps must be strictly high-to-low"
+                );
+            }
             ensure!(
                 previous_time != Some(step.valid_through_ms),
                 "run[{run_index}].adjacent frozen steps with the same timestamp must be merged"
             );
 
-            previous_hi = step.hi_volume;
+            previous_hi = Some(step.hi_volume);
             previous_time = Some(step.valid_through_ms);
         }
 
@@ -581,7 +583,7 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
         }
 
         let mut frozen_steps = Vec::<FrozenStep>::new();
-        let mut previous_hi = f64::INFINITY;
+        let mut previous_hi: Option<f64> = None;
 
         for (step_index, band) in run.frozen_bands.into_iter().enumerate() {
             ensure!(
@@ -597,10 +599,12 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
                 continue;
             }
 
-            ensure!(
-                band.hi_volume < previous_hi && !same_volume(band.hi_volume, previous_hi),
-                "v5 run[{run_index}] frozen bands are not high-to-low"
-            );
+            if let Some(previous_hi) = previous_hi {
+                ensure!(
+                    band.hi_volume < previous_hi && !same_volume(band.hi_volume, previous_hi),
+                    "v5 run[{run_index}] frozen bands are not high-to-low"
+                );
+            }
 
             let valid_through_ms = legacy_timestamp_ms(band.valid_through_ms)?;
             if frozen_steps
@@ -614,7 +618,7 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
                 hi_volume: band.hi_volume,
                 valid_through_ms,
             });
-            previous_hi = band.hi_volume;
+            previous_hi = Some(band.hi_volume);
         }
 
         while frozen_steps.last().is_some_and(|step| {
@@ -789,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn same_timestamp_extends_frozen_region_without_another_step() {
+    fn successive_decreases_preserve_each_observation_time() {
         let mut memory = PressureFrontierMemory::default();
         memory
             .observe_levels(
@@ -824,10 +828,16 @@ mod tests {
         };
         assert_eq!(
             runs[0].frozen_steps,
-            vec![FrozenStep {
-                hi_volume: 10.0,
-                valid_through_ms: 1_000,
-            }]
+            vec![
+                FrozenStep {
+                    hi_volume: 10.0,
+                    valid_through_ms: 1_000,
+                },
+                FrozenStep {
+                    hi_volume: 8.0,
+                    valid_through_ms: 2_000,
+                },
+            ]
         );
         assert_eq!(runs[0].volume, 6.0);
     }
