@@ -6,8 +6,7 @@ use serde_json::Value;
 use crate::book::RawBookLevel;
 
 pub const DEFAULT_CLOB_REST_URL: &str = "https://clob.polymarket.com";
-pub const DEFAULT_CLOB_MARKET_WS_URL: &str =
-    "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+pub const DEFAULT_CLOB_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 #[derive(Debug, Clone)]
 pub struct PolymarketRestClient {
@@ -149,10 +148,7 @@ pub fn event_timestamp_ms(value: Option<&Value>, fallback_ms: i64) -> i64 {
     let Some(timestamp) = timestamp else {
         return fallback_ms;
     };
-    if !timestamp.is_finite()
-        || timestamp < 0.0
-        || timestamp > fallback_ms as f64 + 60_000.0
-    {
+    if !timestamp.is_finite() || timestamp < 0.0 || timestamp > fallback_ms as f64 + 60_000.0 {
         return fallback_ms;
     }
 
@@ -178,9 +174,7 @@ mod tests {
             [MarketEvent::Book(_)]
         ));
 
-        let array = format!(
-            r#"[{book},{{"event_type":"last_trade_price","asset_id":"123"}}]"#
-        );
+        let array = format!(r#"[{book},{{"event_type":"last_trade_price","asset_id":"123"}}]"#);
         assert_eq!(parse_market_message(&array).len(), 1);
     }
 

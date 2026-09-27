@@ -12,15 +12,10 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::Message,
-};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, warn};
 
-use crate::polymarket::{
-    parse_market_message, MarketEvent, DEFAULT_CLOB_MARKET_WS_URL,
-};
+use crate::polymarket::{DEFAULT_CLOB_MARKET_WS_URL, MarketEvent, parse_market_message};
 
 const MAX_TOKENS_PER_CONNECTION: usize = 200;
 const MAX_SUBSCRIBE_BATCH_TOKENS: usize = 100;
@@ -96,8 +91,7 @@ impl SubscriptionPool {
                 .map(|(&id, _)| id);
 
             if let Some(shard_id) = existing {
-                let capacity =
-                    MAX_TOKENS_PER_CONNECTION - self.shards[&shard_id].token_ids.len();
+                let capacity = MAX_TOKENS_PER_CONNECTION - self.shards[&shard_id].token_ids.len();
                 let additions = take_first(&mut pending, capacity);
                 self.assign_to_shard(shard_id, additions).await;
                 continue;
@@ -247,7 +241,11 @@ async fn run_shard(
             }
         };
 
-        debug!(shard_id, tokens = token_ids.len(), "Polymarket websocket connected");
+        debug!(
+            shard_id,
+            tokens = token_ids.len(),
+            "Polymarket websocket connected"
+        );
         snapshot_requested_at.clear();
         for token_id in &token_ids {
             snapshot_requested_at.insert(token_id.clone(), connection_requested_at_ms);

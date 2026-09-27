@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
-use crate::pressure::{FrontierLevel, PressureLevelChange, PRICE_SCALE};
+use crate::pressure::{FrontierLevel, PRICE_SCALE, PressureLevelChange};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawBookLevel {
@@ -135,10 +135,7 @@ mod tests {
     #[test]
     fn ask_book_ignores_bids_but_applies_sells() {
         let mut book = AskBook::default();
-        assert_eq!(
-            book.apply_change("BUY", "0.5", "12").unwrap(),
-            None
-        );
+        assert_eq!(book.apply_change("BUY", "0.5", "12").unwrap(), None);
 
         assert_eq!(
             book.apply_change("SELL", "0.5", "12").unwrap(),
