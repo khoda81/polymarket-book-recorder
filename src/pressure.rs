@@ -620,15 +620,44 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
             }
         }
         None => {
+            let has_current_pressure = runs.iter().any(|run| run.shares > 0.0);
             ensure!(
-                runs.is_empty(),
-                "v5 unobserved pressure snapshot contains state"
+                !has_current_pressure,
+                "v5 pressure snapshot has current shares but no current valid-through timestamp"
             );
-            MemoryState::Unobserved
+
+            match newest_frozen_valid_through_ms(&runs) {
+                Some(valid_through_ms) => {
+                    // v5 deliberately allowed frozen-only history with no
+                    // current timestamp. Its restore path used the newest
+                    // frozen timestamp as lastUpdateMs, so carrying that value
+                    // into v6's observation watermark preserves the same
+                    // transition semantics without adding a redundant state.
+                    validate_runs(&runs, valid_through_ms)?;
+                    MemoryState::Observed {
+                        valid_through_ms,
+                        runs,
+                    }
+                }
+                None => {
+                    ensure!(
+                        runs.is_empty(),
+                        "v5 pressure snapshot contains empty price boundaries"
+                    );
+                    MemoryState::Unobserved
+                }
+            }
         }
     };
 
     Ok(PressureFrontierMemory { state })
+}
+
+fn newest_frozen_valid_through_ms(runs: &[PressureRun]) -> Option<i64> {
+    runs.iter()
+        .flat_map(|run| run.frozen_steps.iter())
+        .map(|step| step.valid_through_ms)
+        .max()
 }
 
 fn normalize_legacy_levels(levels: &[LegacyFrontierLevelV5]) -> Result<BTreeMap<u16, f64>> {
@@ -894,6 +923,53 @@ mod tests {
                 hi_volume: 10.0,
                 valid_through_ms: 2_000,
             }]
+        );
+    }
+
+    #[test]
+    fn v5_frozen_only_history_uses_newest_history_as_v6_watermark() {
+        let json = r#"{
+          "version": 5,
+          "current": [],
+          "field": {
+            "maxPrice": 10000,
+            "currentValidThroughMs": null,
+            "runs": [{
+              "price": 5000,
+              "volume": 0.0,
+              "frozenBands": [
+                {"loVolume": 4.0, "hiVolume": 10.0, "validThroughMs": 1000},
+                {"loVolume": 0.0, "hiVolume": 4.0, "validThroughMs": 2000}
+              ]
+            }]
+          }
+        }"#;
+
+        let memory = migrate_v5_checkpoint_json(json).unwrap();
+        assert!(memory.current_levels().is_empty());
+
+        let SnapshotState::Observed {
+            valid_through_ms,
+            runs,
+        } = memory.snapshot().state
+        else {
+            panic!("expected frozen-only v5 history to become observed v6 state");
+        };
+
+        assert_eq!(valid_through_ms, 2_000);
+        assert_eq!(runs[0].shares, 0.0);
+        assert_eq!(
+            runs[0].frozen_steps,
+            vec![
+                FrozenStep {
+                    hi_volume: 10.0,
+                    valid_through_ms: 1_000,
+                },
+                FrozenStep {
+                    hi_volume: 4.0,
+                    valid_through_ms: 2_000,
+                },
+            ]
         );
     }
 
