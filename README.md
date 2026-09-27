@@ -2,9 +2,9 @@
 
 Rust recorder backend for [Polymarket Viz](https://github.com/khoda81/polymarket-book-vis).
 
-The rewrite deliberately preserves the existing recorder contract and persisted
-format so the Rust and TypeScript implementations can be tested against one
-another before cutover.
+The rewrite preserves the recorder HTTP contract while replacing the pressure
+persistence model with canonical v6 state. Opening a v5 database migrates it to
+v6 atomically before the recorder starts.
 
 ## What is ported
 
@@ -13,10 +13,11 @@ another before cutover.
   continuity invalidation
 - exact integer price ticks
 - token-local ask-book pressure tracking
-- pressure frontier / frozen-band history
-- SQLite schema version 5
-- gzip-compressed pressure frontier checkpoints
-- compact binary pressure mutation tails
+- v6 pressure history as current cumulative volumes + frozen upper-edge steps
+- no persisted lower band edges and no duplicated current frontier
+- SQLite schema version 6 with automatic v5 -> v6 migration
+- gzip-compressed pressure checkpoints
+- compact binary pressure mutation tails with integer millisecond timestamps
 - checkpoint + tail replay
 - incremental writeback with a checkpoint every 512 mutations
 - `GET /api/recorder/health`
@@ -66,6 +67,8 @@ tokens, then compare their state responses:
     curl 'http://127.0.0.1:3001/api/recorder/state?tokenId=TOKEN_ID'
     curl 'http://127.0.0.1:3002/api/recorder/state?tokenId=TOKEN_ID'
 
-The TypeScript recorder remains the differential oracle until live state and
-restart behavior agree under real traffic. No database migration is required:
-the Rust recorder reads and writes the same v5 format.
+The TypeScript recorder remains the differential oracle for live market
+behavior until cutover. It still writes v5, so never point both processes at
+the same SQLite file. Give Rust a copy: on first open it atomically consumes the
+v5 checkpoint + mutation tail and replaces them with one canonical v6
+checkpoint.
