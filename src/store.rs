@@ -13,9 +13,7 @@ use serde::Serialize;
 use tracing::info;
 
 use crate::{
-    pressure::{
-        PressureFrontierMemory, PressureFrontierSnapshot, migrate_v5_checkpoint_json,
-    },
+    pressure::{PressureFrontierMemory, PressureFrontierSnapshot, migrate_v5_checkpoint_json},
     pressure_log::{
         RecorderPressureMutation, decode_pressure_mutation, decode_v5_pressure_mutation,
         encode_pressure_mutation, replay_pressure_mutation,
@@ -522,10 +520,7 @@ fn migrate_database_v5_to_v6(connection: &mut Connection) -> Result<()> {
 
         statement
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -558,7 +553,10 @@ fn migrate_database_v5_to_v6(connection: &mut Connection) -> Result<()> {
     for record in legacy_records {
         let mut memory = match record.checkpoint {
             Some(checkpoint) => decode_v5_checkpoint(&checkpoint).with_context(|| {
-                format!("migrating v5 pressure checkpoint for token {}", record.token_id)
+                format!(
+                    "migrating v5 pressure checkpoint for token {}",
+                    record.token_id
+                )
             })?,
             None => PressureFrontierMemory::default(),
         };
@@ -707,10 +705,7 @@ mod tests {
 
         assert_eq!(store.mutation_count("token").unwrap(), 0);
         let restored = store.load("token").unwrap().unwrap().pressure.unwrap();
-        assert_eq!(
-            PressureFrontierMemory::restore(restored).unwrap(),
-            memory
-        );
+        assert_eq!(PressureFrontierMemory::restore(restored).unwrap(), memory);
         assert_eq!(store.stats().unwrap().pressure_log_mutations, 0);
     }
 }

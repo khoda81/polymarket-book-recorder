@@ -95,10 +95,7 @@ fn migrates_v5_checkpoint_and_tail_to_canonical_v6() {
     assert_eq!(json["state"]["kind"], "observed");
     assert_eq!(json["state"]["validThroughMs"], 2_000);
     assert_eq!(json["state"]["runs"][0]["volume"], 4.0);
-    assert_eq!(
-        json["state"]["runs"][0]["frozenSteps"][0]["hiVolume"],
-        10.0
-    );
+    assert_eq!(json["state"]["runs"][0]["frozenSteps"][0]["hiVolume"], 10.0);
     assert_eq!(
         json["state"]["runs"][0]["frozenSteps"][0]["validThroughMs"],
         1_000

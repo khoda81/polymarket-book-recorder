@@ -227,8 +227,13 @@ impl PressureFrontierMemory {
     }
 
     fn normalize_time(&self, value: i64) -> Result<i64> {
-        ensure!(value >= 0, "pressure frontier timestamp must be non-negative");
-        Ok(self.valid_through_ms().map_or(value, |last| value.max(last)))
+        ensure!(
+            value >= 0,
+            "pressure frontier timestamp must be non-negative"
+        );
+        Ok(self
+            .valid_through_ms()
+            .map_or(value, |last| value.max(last)))
     }
 
     fn take_runs(&mut self) -> Vec<PressureRun> {
@@ -303,9 +308,8 @@ fn level_deltas(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter_map(|price| {
-            let delta =
-                next.get(&price).copied().unwrap_or(0.0)
-                    - previous.get(&price).copied().unwrap_or(0.0);
+            let delta = next.get(&price).copied().unwrap_or(0.0)
+                - previous.get(&price).copied().unwrap_or(0.0);
             (delta != 0.0).then_some(PressureLevelDelta { price, delta })
         })
         .collect()
@@ -467,8 +471,7 @@ fn states_equal(a: &PressureRun, b: &PressureRun) -> bool {
     same_volume(a.volume, b.volume)
         && a.frozen_steps.len() == b.frozen_steps.len()
         && a.frozen_steps.iter().zip(&b.frozen_steps).all(|(a, b)| {
-            same_volume(a.hi_volume, b.hi_volume)
-                && a.valid_through_ms == b.valid_through_ms
+            same_volume(a.hi_volume, b.hi_volume) && a.valid_through_ms == b.valid_through_ms
         })
 }
 
@@ -507,8 +510,7 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
                 "run[{run_index}].frozenSteps[{step_index}].hiVolume must be finite and non-negative"
             );
             ensure!(
-                step.valid_through_ms >= 0
-                    && step.valid_through_ms <= current_valid_through_ms,
+                step.valid_through_ms >= 0 && step.valid_through_ms <= current_valid_through_ms,
                 "run[{run_index}].frozenSteps[{step_index}] has invalid valid-through timestamp"
             );
             ensure!(
@@ -516,8 +518,7 @@ fn validate_runs(runs: &[PressureRun], current_valid_through_ms: i64) -> Result<
                 "run[{run_index}].frozenSteps[{step_index}] must sit above current volume"
             );
             ensure!(
-                step.hi_volume < previous_hi
-                    && !same_volume(step.hi_volume, previous_hi),
+                step.hi_volume < previous_hi && !same_volume(step.hi_volume, previous_hi),
                 "run[{run_index}].frozenSteps must be strictly high-to-low"
             );
             ensure!(
@@ -597,8 +598,7 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
             }
 
             ensure!(
-                band.hi_volume < previous_hi
-                    && !same_volume(band.hi_volume, previous_hi),
+                band.hi_volume < previous_hi && !same_volume(band.hi_volume, previous_hi),
                 "v5 run[{run_index}] frozen bands are not high-to-low"
             );
 
@@ -632,9 +632,7 @@ pub(crate) fn migrate_v5_checkpoint_json(json: &str) -> Result<PressureFrontierM
     }
 
     if let Some((&last_level_price, _)) = level_iter.peek().copied() {
-        bail!(
-            "v5 pressure field is missing current frontier boundary at price {last_level_price}"
-        );
+        bail!("v5 pressure field is missing current frontier boundary at price {last_level_price}");
     }
 
     merge_adjacent_runs(&mut runs);
