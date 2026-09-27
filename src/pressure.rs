@@ -544,10 +544,10 @@ fn transition_run(
                 continue;
             }
 
-            if let Some(last) = run.frozen_bands.last_mut() {
-                if last.lo_volume < next_volume {
-                    last.lo_volume = next_volume;
-                }
+            if let Some(last) = run.frozen_bands.last_mut()
+                && last.lo_volume < next_volume
+            {
+                last.lo_volume = next_volume;
             }
             break;
         }
