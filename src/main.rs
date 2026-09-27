@@ -21,6 +21,11 @@ struct Args {
     /// HTTP API port.
     #[arg(long, default_value_t = 3001)]
     port: u16,
+
+    /// Open and migrate the database if needed, then exit without connecting
+    /// to Polymarket.
+    #[arg(long)]
+    migrate_only: bool,
 }
 
 #[tokio::main]
@@ -35,6 +40,11 @@ async fn main() -> Result<()> {
         .init();
 
     let store = Arc::new(RecorderStore::open(&args.database)?);
+    if args.migrate_only {
+        info!(database = %args.database.display(), "database migration/check complete");
+        return Ok(());
+    }
+
     let runtime = recorder::start(store).await?;
     let app = api::router(runtime.handle());
     let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
