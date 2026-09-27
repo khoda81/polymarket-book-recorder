@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{RawQuery, State},
-    http::{header, Method, StatusCode},
+    http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
@@ -105,17 +105,13 @@ async fn state(
     for token_id in query.token_ids {
         match state.store.load(&token_id)? {
             Some(record) => {
-                if let (Some(since), Some(pressure)) =
-                    (record.recording_since_ms, record.pressure)
+                if let (Some(since), Some(pressure)) = (record.recording_since_ms, record.pressure)
                 {
                     recording_since_ms_by_token.insert(token_id.clone(), since);
                     if !query.metadata_only {
                         states.insert(token_id, TransportState { pressure });
                     }
-                } else if matches!(
-                    record.status,
-                    crate::store::RecorderTokenStatus::Watched
-                ) {
+                } else if matches!(record.status, crate::store::RecorderTokenStatus::Watched) {
                     pending_token_ids.push(token_id);
                 }
             }
@@ -159,7 +155,10 @@ impl StateQuery {
         for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
             match key.as_ref() {
                 "tokenId" => {
-                    for token_id in value.split(',').map(str::trim).filter(|value| !value.is_empty())
+                    for token_id in value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
                     {
                         if seen.insert(token_id.to_owned()) {
                             token_ids.push(token_id.to_owned());
@@ -208,9 +207,7 @@ mod tests {
 
     #[test]
     fn state_query_accepts_repeated_and_comma_separated_tokens() {
-        let query = StateQuery::parse(Some(
-            "tokenId=a,b&tokenId=b&tokenId=c&metadataOnly=1",
-        ));
+        let query = StateQuery::parse(Some("tokenId=a,b&tokenId=b&tokenId=c&metadataOnly=1"));
         assert_eq!(query.token_ids, ["a", "b", "c"]);
         assert!(query.metadata_only);
     }
