@@ -73,7 +73,10 @@ impl AskBook {
 pub fn parse_price(value: &str) -> Result<u16> {
     let value = value.trim();
     let (whole, fraction) = match value.split_once('.') {
-        Some((whole, fraction)) => (whole, Some(fraction)),
+        Some((whole, fraction)) => {
+            ensure!(!fraction.is_empty(), "invalid price: {value}");
+            (whole, Some(fraction))
+        }
         None => (value, None),
     };
 
