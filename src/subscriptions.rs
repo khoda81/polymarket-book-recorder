@@ -32,7 +32,9 @@ const HEARTBEAT_STALE: Duration = Duration::from_secs(30);
 pub enum SubscriptionEvent {
     Market {
         event: MarketEvent,
-        snapshot_requested_at_ms: i64,
+        /// Present only for the first book snapshot caused by a subscribe.
+        /// This send time is a causal lower bound on snapshot generation.
+        snapshot_requested_at_ms: Option<i64>,
     },
     ContinuityLost {
         token_ids: Vec<String>,
@@ -250,7 +252,6 @@ async fn run_shard(
             break;
         }
 
-        let connection_requested_at_ms = now_ms();
         let connection = connect_async(ws_url.as_ref()).await;
         let (socket, _) = match connection {
             Ok(connection) => connection,
@@ -272,23 +273,23 @@ async fn run_shard(
             tokens = token_ids.len(),
             "Polymarket websocket connected"
         );
-        snapshot_requested_at.clear();
-        for token_id in &token_ids {
-            snapshot_requested_at.insert(token_id.clone(), connection_requested_at_ms);
-        }
-
         let (mut sink, mut stream) = socket.split();
         let initial = json!({
             "assets_ids": token_ids.iter().collect::<Vec<_>>(),
             "custom_feature_enabled": true,
             "type": "market",
         });
+        let requested_at_ms = now_ms();
         if sink
             .send(Message::Text(initial.to_string().into()))
             .await
             .is_err()
         {
             continue;
+        }
+        snapshot_requested_at.clear();
+        for token_id in &token_ids {
+            snapshot_requested_at.insert(token_id.clone(), requested_at_ms);
         }
 
         let mut heartbeat =
@@ -301,11 +302,9 @@ async fn run_shard(
                 command = command_rx.recv() => {
                     match command {
                         Some(ShardCommand::Add(added)) => {
-                            let requested_at_ms = now_ms();
                             let mut actual = Vec::new();
                             for token_id in added {
                                 if token_ids.insert(token_id.clone()) {
-                                    snapshot_requested_at.insert(token_id.clone(), requested_at_ms);
                                     actual.push(token_id);
                                 }
                             }
@@ -317,8 +316,13 @@ async fn run_shard(
                                 "custom_feature_enabled": true,
                                 "operation": "subscribe",
                             });
+                            let requested_at_ms = now_ms();
                             if sink.send(Message::Text(message.to_string().into())).await.is_err() {
                                 break true;
+                            }
+                            for token_id in &actual {
+                                snapshot_requested_at
+                                    .insert(token_id.clone(), requested_at_ms);
                             }
                         }
                         Some(ShardCommand::Remove(removed)) => {
@@ -378,18 +382,29 @@ async fn run_shard(
                             last_pong = Instant::now();
                         }
                         Message::Text(text) => {
-                            for event in parse_market_message(text.as_str()) {
-                                let watermark = match &event {
-                                    MarketEvent::Book(book) => snapshot_requested_at
-                                        .get(&book.asset_id)
-                                        .copied()
-                                        .unwrap_or(connection_requested_at_ms),
-                                    _ => connection_requested_at_ms,
+                            let events = match parse_market_message(text.as_str()) {
+                                Ok(events) => events,
+                                Err(error) => {
+                                    warn!(
+                                        shard_id,
+                                        ?error,
+                                        "malformed Polymarket market event broke continuity"
+                                    );
+                                    break true;
+                                }
+                            };
+
+                            for event in events {
+                                let snapshot_requested_at_ms = match &event {
+                                    MarketEvent::Book(book) => {
+                                        snapshot_requested_at.remove(&book.asset_id)
+                                    }
+                                    _ => None,
                                 };
                                 if event_tx
                                     .send(SubscriptionEvent::Market {
                                         event,
-                                        snapshot_requested_at_ms: watermark,
+                                        snapshot_requested_at_ms,
                                     })
                                     .await
                                     .is_err()
