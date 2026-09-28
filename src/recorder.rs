@@ -1057,19 +1057,11 @@ impl AgeRecorder {
 
         let memory = state.pressure.memory_or_default()?;
         let current_watermark_ms = memory.valid_through_ms();
-        let pressure_resolved_at_ms = if unbounded {
-            match (current_watermark_ms, resolved_at_ms) {
-                (Some(current), Some(resolved)) if resolved < current => None,
-                _ => resolved_at_ms,
-            }
-        } else {
-            resolved_at_ms
-        };
 
         if unbounded {
             memory.resolve_unbounded();
         } else {
-            memory.resolve_zero_future(pressure_resolved_at_ms)?;
+            memory.resolve_zero_future(resolved_at_ms)?;
         }
 
         if state.recording_since_ms.is_none() {
