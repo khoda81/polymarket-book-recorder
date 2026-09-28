@@ -21,14 +21,6 @@ pub enum RecorderPressureMutation {
     Clear,
 }
 
-pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation> {
-    decode_pressure_mutation_with_timestamp(value, TimestampEncoding::V6Integer)
-}
-
-pub(crate) fn decode_v5_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation> {
-    decode_pressure_mutation_with_timestamp(value, TimestampEncoding::V5Float)
-}
-
 pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<Vec<u8>> {
     let (kind, valid_through_ms, entries): (u8, i64, Vec<(u16, f64)>) = match mutation {
         RecorderPressureMutation::Clear => return Ok(vec![MUTATION_CLEAR]),
@@ -106,16 +98,7 @@ pub fn replay_pressure_mutation(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TimestampEncoding {
-    V5Float,
-    V6Integer,
-}
-
-fn decode_pressure_mutation_with_timestamp(
-    value: &[u8],
-    timestamp_encoding: TimestampEncoding,
-) -> Result<RecorderPressureMutation> {
+pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation> {
     ensure!(!value.is_empty(), "empty pressure mutation");
 
     let kind = value[0];
@@ -133,24 +116,11 @@ fn decode_pressure_mutation_with_timestamp(
         "truncated pressure mutation"
     );
 
-    let valid_through_ms = match timestamp_encoding {
-        TimestampEncoding::V6Integer => {
-            let value = i64::from_le_bytes(value[1..9].try_into()?);
-            ensure!(
-                value >= 0,
-                "pressure mutation timestamp must be non-negative"
-            );
-            value
-        }
-        TimestampEncoding::V5Float => {
-            let value = f64::from_le_bytes(value[1..9].try_into()?);
-            ensure!(
-                value.is_finite() && value >= 0.0 && value <= i64::MAX as f64,
-                "v5 pressure mutation timestamp is invalid"
-            );
-            value.trunc() as i64
-        }
-    };
+    let valid_through_ms = i64::from_le_bytes(value[1..9].try_into()?);
+    ensure!(
+        valid_through_ms >= 0,
+        "pressure mutation timestamp must be non-negative"
+    );
 
     let count = u16::from_le_bytes(value[9..11].try_into()?) as usize;
     let expected = MUTATION_HEADER_BYTES + count * MUTATION_LEVEL_BYTES;
@@ -235,24 +205,5 @@ mod tests {
         assert_eq!(decode_pressure_mutation(&encoded).unwrap(), mutation);
     }
 
-    #[test]
-    fn v5_float_timestamp_decoder_is_migration_only() {
-        let mut encoded = Vec::new();
-        encoded.push(MUTATION_UPDATE);
-        encoded.extend_from_slice(&1_234.0_f64.to_le_bytes());
-        encoded.extend_from_slice(&1_u16.to_le_bytes());
-        encoded.extend_from_slice(&5_000_u16.to_le_bytes());
-        encoded.extend_from_slice(&4.0_f64.to_le_bytes());
 
-        assert_eq!(
-            decode_v5_pressure_mutation(&encoded).unwrap(),
-            RecorderPressureMutation::Update {
-                valid_through_ms: 1_234,
-                changes: vec![PressureLevelChange {
-                    price: 5_000,
-                    shares: 4.0,
-                }],
-            }
-        );
-    }
 }

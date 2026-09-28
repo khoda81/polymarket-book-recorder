@@ -63,8 +63,6 @@ struct TokenRequest<'a> {
 pub struct RawOrderBook {
     pub asset_id: String,
     #[serde(default)]
-    pub bids: Vec<RawBookLevel>,
-    #[serde(default)]
     pub asks: Vec<RawBookLevel>,
     pub timestamp: Option<Value>,
 }
@@ -79,8 +77,6 @@ pub enum MarketEvent {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookEvent {
     pub asset_id: String,
-    #[serde(default)]
-    pub bids: Vec<RawBookLevel>,
     #[serde(default)]
     pub asks: Vec<RawBookLevel>,
     pub timestamp: Option<Value>,
@@ -105,7 +101,6 @@ pub struct RawPriceChange {
 pub struct MarketResolvedEvent {
     #[serde(default)]
     pub assets_ids: Option<Vec<String>>,
-    pub timestamp: Option<Value>,
 }
 
 pub fn parse_market_message(text: &str) -> Vec<MarketEvent> {
