@@ -63,18 +63,16 @@ pub async fn migrate_database_v7_to_v8(
     );
     info!(
         tokens = token_ids.len(),
-        concurrency,
-        "migrating recorder pressure prices from raw v7 to effective v8"
+        concurrency, "migrating recorder pressure prices from raw v7 to effective v8"
     );
 
     hydrate_fee_metadata(&mut connection, fees, &token_ids, concurrency).await?;
 
     let mut progress = MigrationProgress::new("pressure rewrite", token_ids.len());
     for token_id in &token_ids {
-        let market = fees
-            .cached_for_token(token_id)
-            .cloned()
-            .with_context(|| format!("fee metadata missing for token {token_id} after hydration"))?;
+        let market = fees.cached_for_token(token_id).cloned().with_context(|| {
+            format!("fee metadata missing for token {token_id} after hydration")
+        })?;
 
         if let Some((mut memory, semantic_version)) =
             load_pressure_for_migration(&connection, token_id)?
@@ -149,8 +147,8 @@ async fn hydrate_fee_metadata(
         }
 
         if let Some((token_id, result)) = in_flight.next().await {
-            let market = result
-                .with_context(|| format!("resolving fee schedule for token {token_id}"))?;
+            let market =
+                result.with_context(|| format!("resolving fee schedule for token {token_id}"))?;
             if persisted_markets.insert(market.condition_id.clone()) {
                 persist_market_fee(connection, &market)?;
             }
@@ -352,7 +350,6 @@ fn decode_migration_checkpoint(value: &[u8]) -> Result<(PressureFrontierMemory, 
     Ok((PressureFrontierMemory::restore(snapshot)?, semantic_version))
 }
 
-
 struct MigrationProgress {
     label: &'static str,
     total: usize,
@@ -484,7 +481,6 @@ fn format_duration(duration: Duration) -> String {
         format!("{}s", seconds)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
