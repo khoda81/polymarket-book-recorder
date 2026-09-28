@@ -294,7 +294,6 @@ async fn run_shard(
             snapshot_requested_at.insert(token_id.clone(), requested_at_ms);
         }
 
-        let mut market_timestamp_ms = HashMap::<String, i64>::new();
         let mut heartbeat =
             tokio::time::interval_at(Instant::now() + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -397,26 +396,7 @@ async fn run_shard(
                                 }
                             };
 
-                            let mut timestamp_regressed = false;
                             for event in events {
-                                if let Some(timestamp_ms) = event.timestamp_ms() {
-                                    let market = event.market().to_owned();
-                                    if let Some(previous) = market_timestamp_ms.get(&market)
-                                        && timestamp_ms < *previous
-                                    {
-                                        warn!(
-                                            shard_id,
-                                            market,
-                                            previous_timestamp_ms = *previous,
-                                            timestamp_ms,
-                                            "Polymarket market timestamp regressed; continuity is unsafe"
-                                        );
-                                        timestamp_regressed = true;
-                                        break;
-                                    }
-                                    market_timestamp_ms.insert(market, timestamp_ms);
-                                }
-
                                 let snapshot_requested_at_ms = match &event {
                                     MarketEvent::Book(book) => {
                                         snapshot_requested_at.remove(&book.asset_id)
@@ -434,9 +414,6 @@ async fn run_shard(
                                 {
                                     break 'lifetime;
                                 }
-                            }
-                            if timestamp_regressed {
-                                break true;
                             }
                         }
                         Message::Ping(payload) => {
