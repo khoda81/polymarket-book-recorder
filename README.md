@@ -3,10 +3,7 @@
 Rust recorder backend for [Polymarket Viz](https://github.com/khoda81/polymarket-book-vis).
 
 The recorder persists canonical pressure state in SQLite schema version 7.
-Opening a schema-v6 database performs an eager, resumable migration: each
-legacy checkpoint + mutation tail is replayed with its original semantics,
-collapsed into one v7 checkpoint, and its old mutation rows are deleted before
-the database version is advanced to 7.
+Older database schemas are rejected.
 
 ## Features
 
