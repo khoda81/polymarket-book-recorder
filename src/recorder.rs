@@ -89,7 +89,6 @@ impl PressureState {
         }
     }
 
-
     fn memory_or_default(&mut self) -> Result<&mut PressureFrontierMemory> {
         if matches!(self, Self::Missing) {
             *self = Self::Loaded(PressureFrontierMemory::default());
