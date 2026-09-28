@@ -15,6 +15,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     book::AskBook,
+    fees::{FeeResolver, FeeSchedule},
     polymarket::{MarketEvent, RawPriceChange},
     pressure::{PressureFrontierMemory, PressureFrontierSnapshot, PressureLevel},
     pressure_log::RecorderPressureMutation,
@@ -318,13 +319,14 @@ impl RecorderRuntime {
     }
 }
 
-pub async fn start(store: Arc<RecorderStore>) -> Result<RecorderRuntime> {
+pub async fn start(store: Arc<RecorderStore>, mut fees: FeeResolver) -> Result<RecorderRuntime> {
     let index = store.load_index()?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (subscription_tx, subscription_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
     let mut recorder = AgeRecorder::new(
         store,
+        fees,
         SubscriptionPool::new(subscription_tx),
         command_rx,
         subscription_rx,
@@ -346,6 +348,16 @@ pub async fn start(store: Arc<RecorderStore>) -> Result<RecorderRuntime> {
         .iter()
         .filter_map(|(token_id, state)| state.is_watched().then_some(token_id.clone()))
         .collect::<Vec<_>>();
+    for token_id in &watched {
+        if recorder.fees.cached_for_token(token_id).is_none() {
+            let market = recorder
+                .fees
+                .resolve_token(token_id)
+                .await
+                .with_context(|| format!("resolving fee metadata for watched token {token_id}"))?;
+            recorder.store.save_market_fee(&market)?;
+        }
+    }
     recorder.subscriptions.add(watched).await;
 
     let task = tokio::spawn(recorder.run());
@@ -357,6 +369,7 @@ pub async fn start(store: Arc<RecorderStore>) -> Result<RecorderRuntime> {
 
 struct AgeRecorder {
     store: Arc<RecorderStore>,
+    fees: FeeResolver,
     subscriptions: SubscriptionPool,
     tokens: HashMap<String, TokenState>,
     markets: HashMap<(String, u64), MarketState>,
@@ -368,12 +381,14 @@ struct AgeRecorder {
 impl AgeRecorder {
     fn new(
         store: Arc<RecorderStore>,
+        fees: FeeResolver,
         subscriptions: SubscriptionPool,
         command_rx: mpsc::Receiver<RecorderCommand>,
         subscription_rx: mpsc::Receiver<SubscriptionEvent>,
     ) -> Self {
         Self {
             store,
+            fees,
             subscriptions,
             tokens: HashMap::new(),
             markets: HashMap::new(),
@@ -431,7 +446,7 @@ impl AgeRecorder {
             }
             RecorderCommand::Watch { token_ids, reply } => {
                 let result = async {
-                    let changed = self.watch(token_ids).await;
+                    let changed = self.watch(token_ids).await?;
                     Ok((changed, self.stats()?))
                 }
                 .await
@@ -452,23 +467,34 @@ impl AgeRecorder {
         Ok(false)
     }
 
-    async fn watch(&mut self, token_ids: Vec<String>) -> bool {
-        let mut added = Vec::new();
-        for token_id in token_ids {
-            if token_id.is_empty() || self.tokens.contains_key(&token_id) {
-                continue;
-            }
+    async fn watch(&mut self, token_ids: Vec<String>) -> Result<bool> {
+        let pending = token_ids
+            .into_iter()
+            .filter(|token_id| !token_id.is_empty() && !self.tokens.contains_key(token_id))
+            .collect::<BTreeSet<_>>();
 
+        if pending.is_empty() {
+            return Ok(false);
+        }
+
+        // Fee metadata is part of the book snapshot barrier. Resolve it before
+        // subscribing so no raw-price snapshot can ever enter pressure state.
+        for token_id in &pending {
+            let market = self
+                .fees
+                .resolve_token(token_id)
+                .await
+                .with_context(|| format!("resolving fee metadata for token {token_id}"))?;
+            self.store.save_market_fee(&market)?;
+        }
+
+        let added = pending.into_iter().collect::<Vec<_>>();
+        for token_id in &added {
             self.tokens.insert(
                 token_id.clone(),
                 TokenState::Watched(WatchedTokenState::new(None, PressureState::Missing)),
             );
             self.dirty.insert(token_id.clone());
-            added.push(token_id);
-        }
-
-        if added.is_empty() {
-            return false;
         }
 
         let watched = self
@@ -478,7 +504,7 @@ impl AgeRecorder {
             .count();
         info!(tokens = added.len(), watched, "watching tokens");
         self.subscriptions.add(added).await;
-        true
+        Ok(true)
     }
 
     async fn state(
@@ -487,7 +513,7 @@ impl AgeRecorder {
         include_states: bool,
     ) -> Result<RecorderStateResponse> {
         let requested = dedupe(token_ids);
-        self.watch(requested.clone()).await;
+        self.watch(requested.clone()).await?;
 
         let mut states = BTreeMap::new();
         if include_states {
@@ -642,8 +668,9 @@ impl AgeRecorder {
                             ..
                         }))
                     );
+                    let fee = self.market_fee(&event.market, &token_id)?;
                     let book = AskBook::from_snapshot(&event.asks)?;
-                    let levels = book.pressure_levels();
+                    let levels = book.pressure_levels(fee)?;
 
                     if snapshot_requested_at_ms.is_some() || !was_live {
                         let requested_at_ms = snapshot_requested_at_ms.ok_or_else(|| {
@@ -702,7 +729,8 @@ impl AgeRecorder {
                                 // observation and supersedes any pre-snapshot deltas.
                                 continue;
                             };
-                            apply_book_changes(book, &changes)?
+                            let fee = self.market_fee(&market, &token_id)?;
+                            apply_book_changes(book, &changes, fee)?
                         };
 
                         let valid_through_ms =
@@ -796,6 +824,21 @@ impl AgeRecorder {
             },
         }
         Ok(())
+    }
+
+    fn market_fee(&self, market_id: &str, token_id: &str) -> Result<FeeSchedule> {
+        let market = self
+            .fees
+            .cached_for_token(token_id)
+            .ok_or_else(|| anyhow!("missing fee metadata for token {token_id}"))?;
+        if market.condition_id != market_id {
+            return Err(anyhow!(
+                "token {} belongs to fee market {}, websocket reported {market_id}",
+                short_token(token_id),
+                market.condition_id
+            ));
+        }
+        Ok(market.schedule)
     }
 
     fn register_market_token(
@@ -1191,17 +1234,19 @@ impl AgeRecorder {
 fn apply_book_changes(
     book: &mut AskBook,
     changes: &[RawPriceChange],
+    fee: FeeSchedule,
 ) -> Result<Vec<PressureLevel>> {
-    let mut pressure_changes = BTreeMap::new();
+    let mut affected = BTreeSet::new();
     for change in changes {
-        if let Some(change) = book.apply_change(&change.side, &change.price, &change.size)? {
-            pressure_changes.insert(change.price, change.shares);
+        if let Some(raw_price) = book.apply_change(&change.side, &change.price, &change.size)? {
+            affected.insert(fee.effective_ask_tick(raw_price)?);
         }
     }
-    Ok(pressure_changes
+
+    affected
         .into_iter()
-        .map(|(price, shares)| PressureLevel { price, shares })
-        .collect())
+        .map(|effective_price| book.pressure_level_at(effective_price, fee))
+        .collect()
 }
 
 fn dedupe(token_ids: Vec<String>) -> Vec<String> {
@@ -1225,6 +1270,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn book_changes_reaggregate_effective_price_collisions() {
+        let fee = FeeSchedule::new("0.04".parse().unwrap(), 1).unwrap();
+        let pair = (1..crate::pressure::PRICE_SCALE)
+            .find(|&raw| {
+                fee.effective_ask_tick(raw).unwrap()
+                    == fee.effective_ask_tick(raw + 1).unwrap()
+            })
+            .unwrap();
+        let price_a = format!("{:.4}", f64::from(pair) / 10_000.0);
+        let price_b = format!("{:.4}", f64::from(pair + 1) / 10_000.0);
+        let effective = fee.effective_ask_tick(pair).unwrap();
+
+        let mut book = AskBook::default();
+        book.set_level(pair, 3.0).unwrap();
+        book.set_level(pair + 1, 5.0).unwrap();
+
+        let changes = vec![RawPriceChange {
+            asset_id: "token".into(),
+            price: price_a,
+            size: "4".into(),
+            side: "SELL".into(),
+        }];
+        assert_eq!(
+            apply_book_changes(&mut book, &changes, fee).unwrap(),
+            vec![PressureLevel {
+                price: effective,
+                shares: 9.0,
+            }]
+        );
+
+        let changes = vec![RawPriceChange {
+            asset_id: "token".into(),
+            price: price_b,
+            size: "0".into(),
+            side: "SELL".into(),
+        }];
+        assert_eq!(
+            apply_book_changes(&mut book, &changes, fee).unwrap(),
+            vec![PressureLevel {
+                price: effective,
+                shares: 4.0,
+            }]
+        );
+    }
+
+    #[test]
     fn book_changes_keep_only_ask_pressure() {
         let mut book = AskBook::default();
         let changes = vec![
@@ -1243,7 +1334,7 @@ mod tests {
         ];
 
         assert_eq!(
-            apply_book_changes(&mut book, &changes).unwrap(),
+            apply_book_changes(&mut book, &changes, FeeSchedule::ZERO).unwrap(),
             vec![PressureLevel {
                 price: 6_000,
                 shares: 12.0,
