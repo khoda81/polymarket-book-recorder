@@ -3,8 +3,7 @@
 Rust recorder backend for [Polymarket Viz](https://github.com/khoda81/polymarket-book-vis).
 
 The recorder persists canonical pressure state in SQLite schema version 8.
-Opening a schema-v7 database performs the one-shot raw-price → effective-price
-migration before recording starts. Other older database schemas are rejected.
+Older database schemas are rejected.
 
 ## Features
 
@@ -40,7 +39,7 @@ shared locks.
 
 ## Run
 
-By default the service uses `.data/age-recorder.sqlite` and port `3001`.
+By default the service uses `.data/rust-recorder.sqlite` and port `3001`.
 
 Run a release build with:
 
