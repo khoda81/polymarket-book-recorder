@@ -5,25 +5,49 @@ use crate::pressure::{PRICE_SCALE, PressureFrontierMemory, PressureLevel};
 const MUTATION_CLEAR: u8 = 0;
 const MUTATION_REPLACE: u8 = 1;
 const MUTATION_UPDATE: u8 = 2;
+const MUTATION_ADVANCE: u8 = 3;
+const MUTATION_REPLACE_CONTINUOUS: u8 = 4;
 const MUTATION_HEADER_BYTES: usize = 11;
 const MUTATION_LEVEL_BYTES: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecorderPressureMutation {
+    /// Complete observation after a continuity gap.
     Replace {
         valid_through_ms: i64,
         levels: Vec<PressureLevel>,
     },
+    /// Ordered-stream absolute level changes.
     Update {
         valid_through_ms: i64,
         changes: Vec<PressureLevel>,
     },
+    /// Ordered market evidence that does not change this token's levels.
+    Advance {
+        valid_through_ms: i64,
+    },
+    /// Complete book replacement on a known-continuous stream.
+    ReplaceContinuous {
+        valid_through_ms: i64,
+        levels: Vec<PressureLevel>,
+    },
+    /// Legacy v6 mutation emitted by older recorders on resolution.
     Clear,
 }
 
 pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<Vec<u8>> {
     let (kind, valid_through_ms, entries): (u8, i64, Vec<(u16, f64)>) = match mutation {
         RecorderPressureMutation::Clear => return Ok(vec![MUTATION_CLEAR]),
+        RecorderPressureMutation::Advance { valid_through_ms } => {
+            ensure!(
+                *valid_through_ms >= 0,
+                "pressure mutation timestamp must be non-negative"
+            );
+            let mut bytes = Vec::with_capacity(9);
+            bytes.push(MUTATION_ADVANCE);
+            bytes.extend_from_slice(&valid_through_ms.to_le_bytes());
+            return Ok(bytes);
+        }
         RecorderPressureMutation::Replace {
             valid_through_ms,
             levels,
@@ -44,6 +68,17 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
             changes
                 .iter()
                 .map(|change| (change.price, change.shares))
+                .collect(),
+        ),
+        RecorderPressureMutation::ReplaceContinuous {
+            valid_through_ms,
+            levels,
+        } => (
+            MUTATION_REPLACE_CONTINUOUS,
+            *valid_through_ms,
+            levels
+                .iter()
+                .map(|level| (level.price, level.shares))
                 .collect(),
         ),
     };
@@ -92,7 +127,15 @@ pub fn replay_pressure_mutation(
             changes,
         } => {
             memory.update_levels(&changes, valid_through_ms)?;
+        }
+        RecorderPressureMutation::Advance { valid_through_ms } => {
             memory.observe_through(valid_through_ms)?;
+        }
+        RecorderPressureMutation::ReplaceContinuous {
+            valid_through_ms,
+            levels,
+        } => {
+            memory.replace_continuous(&levels, valid_through_ms)?;
         }
     }
     Ok(())
@@ -108,9 +151,23 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
     }
 
     ensure!(
-        kind == MUTATION_REPLACE || kind == MUTATION_UPDATE,
+        kind == MUTATION_REPLACE
+            || kind == MUTATION_UPDATE
+            || kind == MUTATION_ADVANCE
+            || kind == MUTATION_REPLACE_CONTINUOUS,
         "unsupported pressure mutation kind: {kind}"
     );
+
+    if kind == MUTATION_ADVANCE {
+        ensure!(value.len() == 9, "malformed advance pressure mutation");
+        let valid_through_ms = i64::from_le_bytes(value[1..9].try_into()?);
+        ensure!(
+            valid_through_ms >= 0,
+            "pressure mutation timestamp must be non-negative"
+        );
+        return Ok(RecorderPressureMutation::Advance { valid_through_ms });
+    }
+
     ensure!(
         value.len() >= MUTATION_HEADER_BYTES,
         "truncated pressure mutation"
@@ -143,22 +200,25 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
         offset += MUTATION_LEVEL_BYTES;
     }
 
-    Ok(if kind == MUTATION_REPLACE {
-        RecorderPressureMutation::Replace {
+    let levels = entries
+        .into_iter()
+        .map(|(price, shares)| PressureLevel { price, shares })
+        .collect();
+
+    Ok(match kind {
+        MUTATION_REPLACE => RecorderPressureMutation::Replace {
             valid_through_ms,
-            levels: entries
-                .into_iter()
-                .map(|(price, shares)| PressureLevel { price, shares })
-                .collect(),
-        }
-    } else {
-        RecorderPressureMutation::Update {
+            levels,
+        },
+        MUTATION_UPDATE => RecorderPressureMutation::Update {
             valid_through_ms,
-            changes: entries
-                .into_iter()
-                .map(|(price, shares)| PressureLevel { price, shares })
-                .collect(),
-        }
+            changes: levels,
+        },
+        MUTATION_REPLACE_CONTINUOUS => RecorderPressureMutation::ReplaceContinuous {
+            valid_through_ms,
+            levels,
+        },
+        _ => unreachable!("validated mutation kind above"),
     })
 }
 
