@@ -25,6 +25,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // tokio-tungstenite intentionally leaves rustls' crypto provider
+    // unselected. Install one explicitly before any TLS client is built so
+    // provider choice cannot depend on transitive Cargo feature resolution.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("rustls CryptoProvider was already installed"))?;
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()
