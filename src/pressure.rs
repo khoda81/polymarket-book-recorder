@@ -6,14 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const PRICE_SCALE: u16 = 10_000;
 pub const SNAPSHOT_VERSION: u8 = 6;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FrontierLevel {
-    pub key: u16,
-    pub weight: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PressureLevelChange {
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PressureLevel {
     pub price: u16,
     pub shares: f64,
 }
@@ -136,7 +130,7 @@ impl PressureFrontierMemory {
 
     pub fn observe_levels(
         &mut self,
-        levels: &[FrontierLevel],
+        levels: &[PressureLevel],
         valid_through_ms: i64,
     ) -> Result<bool> {
         let valid_through_ms = self.normalize_time(valid_through_ms)?;
@@ -158,7 +152,7 @@ impl PressureFrontierMemory {
 
     pub fn update_levels(
         &mut self,
-        changes: &[PressureLevelChange],
+        changes: &[PressureLevel],
         valid_through_ms: i64,
     ) -> Result<bool> {
         let valid_through_ms = self.normalize_time(valid_through_ms)?;
@@ -209,10 +203,10 @@ impl PressureFrontierMemory {
         Ok(previous_time != Some(valid_through_ms))
     }
 
-    pub fn current_levels(&self) -> Vec<FrontierLevel> {
+    pub fn current_levels(&self) -> Vec<PressureLevel> {
         self.current_levels_map()
             .into_iter()
-            .map(|(key, weight)| FrontierLevel { key, weight })
+            .map(|(key, weight)| PressureLevel { key, weight })
             .collect()
     }
 
@@ -255,25 +249,25 @@ impl PressureFrontierMemory {
     }
 }
 
-fn normalize_levels(levels: &[FrontierLevel]) -> BTreeMap<u16, f64> {
+fn normalize_levels(levels: &[PressureLevel]) -> BTreeMap<u16, f64> {
     let mut by_price = BTreeMap::<u16, f64>::new();
     for level in levels {
-        if level.key == 0
-            || level.key > PRICE_SCALE
-            || !level.weight.is_finite()
-            || level.weight <= 0.0
+        if level.price == 0
+            || level.price > PRICE_SCALE
+            || !level.shares.is_finite()
+            || level.shares <= 0.0
         {
             continue;
         }
-        *by_price.entry(level.key).or_default() += level.weight;
+        *by_price.entry(level.price).or_default() += level.shares;
     }
     by_price
 }
 
 fn changed_levels(previous: &BTreeMap<u16, f64>, next: &BTreeMap<u16, f64>) -> BTreeMap<u16, f64> {
     previous
-        .keys()
-        .chain(next.keys())
+        .prices()
+        .chain(next.prices())
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -531,16 +525,16 @@ mod tests {
         let mut memory = PressureFrontierMemory::default();
         memory
             .observe_levels(
-                &[FrontierLevel {
-                    key: 5_000,
-                    weight: 10.0,
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
                 }],
                 1_000,
             )
             .unwrap();
         memory
             .update_levels(
-                &[PressureLevelChange {
+                &[PressureLevel {
                     price: 5_000,
                     shares: 4.0,
                 }],
@@ -562,7 +556,7 @@ mod tests {
 
         memory
             .update_levels(
-                &[PressureLevelChange {
+                &[PressureLevel {
                     price: 5_000,
                     shares: 8.0,
                 }],
@@ -588,16 +582,16 @@ mod tests {
         let mut memory = PressureFrontierMemory::default();
         memory
             .observe_levels(
-                &[FrontierLevel {
-                    key: 5_000,
-                    weight: 10.0,
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
                 }],
                 1_000,
             )
             .unwrap();
         memory
             .update_levels(
-                &[PressureLevelChange {
+                &[PressureLevel {
                     price: 5_000,
                     shares: 8.0,
                 }],
@@ -606,7 +600,7 @@ mod tests {
             .unwrap();
         memory
             .update_levels(
-                &[PressureLevelChange {
+                &[PressureLevel {
                     price: 5_000,
                     shares: 6.0,
                 }],
@@ -639,13 +633,13 @@ mod tests {
         memory
             .observe_levels(
                 &[
-                    FrontierLevel {
-                        key: 1_000,
-                        weight: 20.0,
+                    PressureLevel {
+                        price: 1_000,
+                        shares: 20.0,
                     },
-                    FrontierLevel {
-                        key: 3_000,
-                        weight: 35.0,
+                    PressureLevel {
+                        price: 3_000,
+                        shares: 35.0,
                     },
                 ],
                 1_000,
@@ -655,13 +649,13 @@ mod tests {
         assert_eq!(
             memory.current_levels(),
             vec![
-                FrontierLevel {
-                    key: 1_000,
-                    weight: 20.0,
+                PressureLevel {
+                    price: 1_000,
+                    shares: 20.0,
                 },
-                FrontierLevel {
-                    key: 3_000,
-                    weight: 35.0,
+                PressureLevel {
+                    price: 3_000,
+                    shares: 35.0,
                 },
             ]
         );
@@ -697,13 +691,13 @@ mod tests {
             }
 
             memory
-                .update_levels(&[PressureLevelChange { price, shares }], step * 10)
+                .update_levels(&[PressureLevel { price, shares }], step * 10)
                 .unwrap();
 
             let actual = memory
                 .current_levels()
                 .into_iter()
-                .map(|level| (level.key, level.weight))
+                .map(|level| (level.price, level.shares))
                 .collect::<BTreeMap<_, _>>();
             assert_eq!(actual, reference);
 
@@ -719,16 +713,16 @@ mod tests {
         let mut memory = PressureFrontierMemory::default();
         memory
             .observe_levels(
-                &[FrontierLevel {
-                    key: 5_000,
-                    weight: 10.0,
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
                 }],
                 1_000,
             )
             .unwrap();
         memory
             .update_levels(
-                &[PressureLevelChange {
+                &[PressureLevel {
                     price: 5_000,
                     shares: 4.0,
                 }],

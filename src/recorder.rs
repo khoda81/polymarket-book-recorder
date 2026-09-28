@@ -18,7 +18,7 @@ use crate::{
     polymarket::{
         MarketEvent, PolymarketRestClient, RawOrderBook, RawPriceChange, event_timestamp_ms,
     },
-    pressure::{PressureFrontierMemory, PressureFrontierSnapshot, PressureLevelChange},
+    pressure::{PressureFrontierMemory, PressureFrontierSnapshot, PressureLevel},
     pressure_log::RecorderPressureMutation,
     store::{
         RecorderCheckpointWrite, RecorderStore, RecorderStoreWriteRecord, RecorderTokenStatus,
@@ -648,7 +648,7 @@ impl AgeRecorder {
     fn update_memory_replace(
         &mut self,
         token_id: &str,
-        levels: Vec<crate::pressure::FrontierLevel>,
+        levels: Vec<crate::pressure::PressureLevel>,
         valid_through_ms: i64,
     ) -> Result<()> {
         self.ensure_memory(token_id)?;
@@ -672,7 +672,7 @@ impl AgeRecorder {
     fn update_memory_changes(
         &mut self,
         token_id: &str,
-        changes: Vec<PressureLevelChange>,
+        changes: Vec<PressureLevel>,
         valid_through_ms: i64,
     ) -> Result<()> {
         self.ensure_memory(token_id)?;
@@ -801,7 +801,7 @@ impl AgeRecorder {
 fn apply_book_changes(
     book: &mut AskBook,
     changes: &[RawPriceChange],
-) -> Result<Vec<PressureLevelChange>> {
+) -> Result<Vec<PressureLevel>> {
     let mut pressure_changes = Vec::new();
     for change in changes {
         if let Some(change) = book.apply_change(&change.side, &change.price, &change.size)? {
@@ -859,7 +859,7 @@ mod tests {
 
         assert_eq!(
             apply_book_changes(&mut book, &changes).unwrap(),
-            vec![PressureLevelChange {
+            vec![PressureLevel {
                 price: 6_000,
                 shares: 12.0,
             }]

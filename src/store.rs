@@ -503,16 +503,16 @@ fn encode_checkpoint(snapshot: &PressureFrontierSnapshot) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pressure::{FrontierLevel, PressureLevelChange};
+    use crate::pressure::{PressureLevel, PressureLevel};
     use tempfile::tempdir;
 
     fn one_level_memory() -> PressureFrontierMemory {
         let mut memory = PressureFrontierMemory::default();
         memory
             .observe_levels(
-                &[FrontierLevel {
-                    key: 5_000,
-                    weight: 10.0,
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
                 }],
                 1_000,
             )
@@ -527,7 +527,7 @@ mod tests {
 
         let mutation = RecorderPressureMutation::Update {
             valid_through_ms: 2_000,
-            changes: vec![PressureLevelChange {
+            changes: vec![PressureLevel {
                 price: 5_000,
                 shares: 4.0,
             }],

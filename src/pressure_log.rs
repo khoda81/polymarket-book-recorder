@@ -1,6 +1,6 @@
 use anyhow::{Result, bail, ensure};
 
-use crate::pressure::{FrontierLevel, PRICE_SCALE, PressureFrontierMemory, PressureLevelChange};
+use crate::pressure::{PressureLevel, PRICE_SCALE, PressureFrontierMemory, PressureLevel};
 
 const MUTATION_CLEAR: u8 = 0;
 const MUTATION_REPLACE: u8 = 1;
@@ -12,11 +12,11 @@ const MUTATION_LEVEL_BYTES: usize = 10;
 pub enum RecorderPressureMutation {
     Replace {
         valid_through_ms: i64,
-        levels: Vec<FrontierLevel>,
+        levels: Vec<PressureLevel>,
     },
     Update {
         valid_through_ms: i64,
-        changes: Vec<PressureLevelChange>,
+        changes: Vec<PressureLevel>,
     },
     Clear,
 }
@@ -32,7 +32,7 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
             *valid_through_ms,
             levels
                 .iter()
-                .map(|level| (level.key, level.weight))
+                .map(|level| (level.price, level.shares))
                 .collect(),
         ),
         RecorderPressureMutation::Update {
@@ -148,7 +148,7 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
             valid_through_ms,
             levels: entries
                 .into_iter()
-                .map(|(key, weight)| FrontierLevel { key, weight })
+                .map(|(price, shares)| PressureLevel { price, shares })
                 .collect(),
         }
     } else {
@@ -156,7 +156,7 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
             valid_through_ms,
             changes: entries
                 .into_iter()
-                .map(|(price, shares)| PressureLevelChange { price, shares })
+                .map(|(price, shares)| PressureLevel { price, shares })
                 .collect(),
         }
     })
@@ -184,11 +184,11 @@ mod tests {
         let mutation = RecorderPressureMutation::Update {
             valid_through_ms: 1_234,
             changes: vec![
-                PressureLevelChange {
+                PressureLevel {
                     price: 125,
                     shares: 12.5,
                 },
-                PressureLevelChange {
+                PressureLevel {
                     price: 9_875,
                     shares: 0.0,
                 },
