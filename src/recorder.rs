@@ -55,7 +55,6 @@ pub struct RecorderStats {
     pub subscription_connections: usize,
     pub connected_subscription_connections: usize,
     pub assigned_subscription_tokens: usize,
-    pub subscription_batches: usize,
     pub dirty_tokens: usize,
     pub pending_pressure_mutations: usize,
     pub oldest_recording_since_ms: Option<i64>,
@@ -444,7 +443,6 @@ impl AgeRecorder {
             subscription_connections: self.subscriptions.active_connection_count(),
             connected_subscription_connections: self.subscriptions.connected_connection_count(),
             assigned_subscription_tokens: self.subscriptions.assigned_token_count(),
-            subscription_batches: self.subscriptions.active_connection_count(),
             dirty_tokens: self.dirty.len(),
             pending_pressure_mutations: self
                 .pending_pressure_mutations
@@ -713,8 +711,7 @@ impl AgeRecorder {
             return Ok(());
         }
 
-        let record = self.store.load(token_id)?;
-        match record.and_then(|record| record.pressure) {
+        match self.store.load_pressure(token_id)? {
             Some(snapshot) => {
                 self.memories.insert(
                     token_id.to_owned(),

@@ -20,11 +20,10 @@ use tracing::{debug, warn};
 use crate::polymarket::{DEFAULT_CLOB_MARKET_WS_URL, MarketEvent, parse_market_message};
 
 // Empirically, Polymarket can silently stop producing initial book snapshots
-// when a physical market websocket owns more than ~100 assets. The recorder
-// cannot tolerate "subscribed but never hydrated", so keep the physical cap
-// equal to the known-good wire batch size.
-const MAX_TOKENS_PER_CONNECTION: usize = 100;
-const MAX_SUBSCRIBE_BATCH_TOKENS: usize = 100;
+// when a physical market websocket owns more than ~100 assets. Use one limit
+// for both physical shards and wire subscribe batches so a shard cannot grow
+// beyond the known-good request size.
+const MAX_TOKENS_PER_SHARD: usize = 100;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_STALE: Duration = Duration::from_secs(30);
@@ -103,17 +102,17 @@ impl SubscriptionPool {
             let existing = self
                 .shards
                 .iter()
-                .find(|(_, shard)| shard.token_ids.len() < MAX_TOKENS_PER_CONNECTION)
+                .find(|(_, shard)| shard.token_ids.len() < MAX_TOKENS_PER_SHARD)
                 .map(|(&id, _)| id);
 
             if let Some(shard_id) = existing {
-                let capacity = MAX_TOKENS_PER_CONNECTION - self.shards[&shard_id].token_ids.len();
+                let capacity = MAX_TOKENS_PER_SHARD - self.shards[&shard_id].token_ids.len();
                 let additions = take_first(&mut pending, capacity);
                 self.assign_to_shard(shard_id, additions).await;
                 continue;
             }
 
-            let initial = take_first(&mut pending, MAX_SUBSCRIBE_BATCH_TOKENS);
+            let initial = take_first(&mut pending, MAX_TOKENS_PER_SHARD);
             self.create_shard(initial);
         }
     }
@@ -146,7 +145,7 @@ impl SubscriptionPool {
             }
 
             if let Some(shard) = self.shards.get(&shard_id) {
-                for chunk in removed.chunks(MAX_SUBSCRIBE_BATCH_TOKENS) {
+                for chunk in removed.chunks(MAX_TOKENS_PER_SHARD) {
                     let _ = shard
                         .command_tx
                         .send(ShardCommand::Remove(chunk.to_vec()))
@@ -179,7 +178,7 @@ impl SubscriptionPool {
             self.owner_by_token.insert(token_id.clone(), shard_id);
         }
 
-        for chunk in additions.chunks(MAX_SUBSCRIBE_BATCH_TOKENS) {
+        for chunk in additions.chunks(MAX_TOKENS_PER_SHARD) {
             let _ = shard
                 .command_tx
                 .send(ShardCommand::Add(chunk.to_vec()))
