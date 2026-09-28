@@ -266,6 +266,36 @@ impl TokenState {
             Self::Completed(state) => &mut state.pending_pressure_mutations,
         }
     }
+
+    fn complete(self) -> (Self, bool) {
+        match self {
+            Self::Watched(mut state) => {
+                if let Some(memory) = state.pressure.memory_mut() {
+                    memory.clear();
+                    state
+                        .pending_pressure_mutations
+                        .push(RecorderPressureMutation::Clear);
+                }
+                (
+                    Self::Completed(CompletedTokenState {
+                        recording_since_ms: state.recording_since_ms,
+                        pressure: state.pressure,
+                        pending_pressure_mutations: state.pending_pressure_mutations,
+                    }),
+                    true,
+                )
+            }
+            Self::Completed(mut state) => {
+                if let Some(memory) = state.pressure.memory_mut() {
+                    memory.clear();
+                    state
+                        .pending_pressure_mutations
+                        .push(RecorderPressureMutation::Clear);
+                }
+                (Self::Completed(state), false)
+            }
+        }
+    }
 }
 
 enum RecorderCommand {
@@ -536,7 +566,11 @@ impl AgeRecorder {
             return false;
         }
 
-        let watched = self.tokens.values().filter(|state| state.is_watched()).count();
+        let watched = self
+            .tokens
+            .values()
+            .filter(|state| state.is_watched())
+            .count();
         info!(tokens = added.len(), watched, "watching tokens");
         self.subscriptions.add(added).await;
         true
@@ -583,9 +617,9 @@ impl AgeRecorder {
         let pending_token_ids = requested
             .into_iter()
             .filter(|token_id| {
-                self.tokens.get(token_id).is_some_and(|state| {
-                    state.is_watched() && state.pressure().is_missing()
-                })
+                self.tokens
+                    .get(token_id)
+                    .is_some_and(|state| state.is_watched() && state.pressure().is_missing())
             })
             .collect();
 
@@ -606,7 +640,11 @@ impl AgeRecorder {
         let store = self.store.stats()?;
 
         Ok(RecorderStats {
-            watched_tokens: self.tokens.values().filter(|state| state.is_watched()).count(),
+            watched_tokens: self
+                .tokens
+                .values()
+                .filter(|state| state.is_watched())
+                .count(),
             completed_tokens: self
                 .tokens
                 .values()
@@ -715,7 +753,8 @@ impl AgeRecorder {
                 for snapshot in snapshots {
                     let token_id = snapshot.asset_id.clone();
                     let buffered = {
-                        let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id) else {
+                        let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id)
+                        else {
                             continue;
                         };
                         if state.pressure.memory().is_some() {
@@ -820,15 +859,12 @@ impl AgeRecorder {
 
                     for (token_id, changes) in by_token {
                         let pressure_changes = {
-                            let Some(TokenState::Watched(state)) =
-                                self.tokens.get_mut(&token_id)
+                            let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id)
                             else {
                                 continue;
                             };
                             match &mut state.book {
-                                BookState::Live(book) => {
-                                    Some(apply_book_changes(book, &changes)?)
-                                }
+                                BookState::Live(book) => Some(apply_book_changes(book, &changes)?),
                                 BookState::Unhydrated { buffered } => {
                                     buffered.push(BufferedPriceChangeEvent {
                                         timestamp_ms,
@@ -840,11 +876,7 @@ impl AgeRecorder {
                         };
 
                         if let Some(pressure_changes) = pressure_changes {
-                            self.update_memory_changes(
-                                &token_id,
-                                pressure_changes,
-                                timestamp_ms,
-                            )?;
+                            self.update_memory_changes(&token_id, pressure_changes, timestamp_ms)?;
                         }
                     }
                 }
@@ -856,28 +888,12 @@ impl AgeRecorder {
                         }
 
                         let next = match self.tokens.remove(&token_id) {
-                            Some(TokenState::Watched(mut state)) => {
-                                if let Some(memory) = state.pressure.memory_mut() {
-                                    memory.clear();
-                                    state
-                                        .pending_pressure_mutations
-                                        .push(RecorderPressureMutation::Clear);
+                            Some(state) => {
+                                let (completed, was_watched) = state.complete();
+                                if was_watched {
+                                    removed.push(token_id.clone());
                                 }
-                                removed.push(token_id.clone());
-                                TokenState::Completed(CompletedTokenState {
-                                    recording_since_ms: state.recording_since_ms,
-                                    pressure: state.pressure,
-                                    pending_pressure_mutations: state.pending_pressure_mutations,
-                                })
-                            }
-                            Some(TokenState::Completed(mut state)) => {
-                                if let Some(memory) = state.pressure.memory_mut() {
-                                    memory.clear();
-                                    state
-                                        .pending_pressure_mutations
-                                        .push(RecorderPressureMutation::Clear);
-                                }
-                                TokenState::Completed(state)
+                                completed
                             }
                             None => TokenState::Completed(CompletedTokenState {
                                 recording_since_ms: None,
@@ -1023,10 +1039,7 @@ impl AgeRecorder {
                     .get(token_id)
                     .and_then(|state| state.pressure().memory())
                     .map(PressureFrontierMemory::snapshot);
-                (
-                    Vec::new(),
-                    RecorderCheckpointWrite::Replace(snapshot),
-                )
+                (Vec::new(), RecorderCheckpointWrite::Replace(snapshot))
             } else {
                 (mutations, RecorderCheckpointWrite::Keep)
             };
@@ -1108,6 +1121,41 @@ fn short_token(token_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completing_token_moves_transient_watched_state_into_completed_state() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 6_000,
+                    shares: 12.0,
+                }],
+                1_000,
+            )
+            .unwrap();
+
+        let state = TokenState::Watched(WatchedTokenState {
+            recording_since_ms: Some(1_000),
+            pressure: PressureState::Loaded(memory),
+            book: BookState::default(),
+            pending_pressure_mutations: Vec::new(),
+            seed: SeedState::InFlight,
+        });
+
+        let (state, was_watched) = state.complete();
+        assert!(was_watched);
+
+        let TokenState::Completed(state) = state else {
+            panic!("completed token must not retain watched-only state");
+        };
+        assert_eq!(state.recording_since_ms, Some(1_000));
+        assert!(state.pressure.memory().unwrap().current_levels().is_empty());
+        assert_eq!(
+            state.pending_pressure_mutations,
+            vec![RecorderPressureMutation::Clear]
+        );
+    }
 
     #[test]
     fn book_changes_keep_only_ask_pressure() {
