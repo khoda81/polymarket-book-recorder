@@ -72,6 +72,7 @@ pub struct RawOrderBook {
 pub enum MarketEvent {
     Book(BookEvent),
     PriceChange(PriceChangeEvent),
+    Watermark(MarketWatermarkEvent),
     MarketResolved(MarketResolvedEvent),
 }
 
@@ -103,6 +104,17 @@ pub struct PriceChangeEvent {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct MarketWatermarkEvent {
+    pub market: String,
+    #[serde(
+        default,
+        rename = "timestamp",
+        deserialize_with = "deserialize_optional_epoch_ms"
+    )]
+    pub timestamp_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawPriceChange {
     pub asset_id: String,
     pub price: String,
@@ -125,6 +137,7 @@ impl MarketEvent {
         match self {
             Self::Book(event) => &event.market,
             Self::PriceChange(event) => &event.market,
+            Self::Watermark(event) => &event.market,
             Self::MarketResolved(event) => &event.market,
         }
     }
@@ -133,6 +146,7 @@ impl MarketEvent {
         match self {
             Self::Book(event) => event.timestamp_ms,
             Self::PriceChange(event) => event.timestamp_ms,
+            Self::Watermark(event) => event.timestamp_ms,
             Self::MarketResolved(event) => Some(event.timestamp_ms),
         }
     }
@@ -167,6 +181,12 @@ fn parse_market_event(value: Value) -> Result<Option<MarketEvent>> {
         "price_change" => MarketEvent::PriceChange(
             serde_json::from_value(value).context("decoding price-change market event")?,
         ),
+        "last_trade_price" | "tick_size_change" | "best_bid_ask" => {
+            MarketEvent::Watermark(
+                serde_json::from_value(value)
+                    .context("decoding market watermark event")?,
+            )
+        }
         "market_resolved" => MarketEvent::MarketResolved(
             serde_json::from_value(value).context("decoding market-resolved event")?,
         ),
