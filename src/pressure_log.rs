@@ -119,7 +119,7 @@ pub fn replay_pressure_mutation(
     mutation: RecorderPressureMutation,
 ) -> Result<()> {
     match mutation {
-        RecorderPressureMutation::Clear => memory.clear(),
+        RecorderPressureMutation::Clear => memory.clear_legacy(),
         RecorderPressureMutation::Replace {
             valid_through_ms,
             levels,
