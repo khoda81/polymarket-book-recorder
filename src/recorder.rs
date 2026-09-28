@@ -859,14 +859,15 @@ impl AgeRecorder {
         let watermark_ms = {
             let market = self.markets.entry(key).or_default();
             if let Some(timestamp_ms) = timestamp_ms {
-                if let Some(previous) = market.watermark_ms {
-                    if timestamp_ms < previous {
-                        return Err(anyhow!(
-                            "market {market_id} timestamp regressed on shard {shard_id}: {timestamp_ms} < {previous}"
-                        ));
-                    }
-                }
-                market.watermark_ms = Some(timestamp_ms);
+                // Exchange timestamps are evidence, not a sequence number.
+                // Delivery order is the causal order; the timestamp field is
+                // therefore a max-aggregated lower bound for that market on
+                // this stream.
+                market.watermark_ms = Some(
+                    market
+                        .watermark_ms
+                        .map_or(timestamp_ms, |previous| previous.max(timestamp_ms)),
+                );
             }
             market.watermark_ms
         };
