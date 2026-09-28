@@ -64,10 +64,7 @@ async fn state(
         .await?;
 
     let message = crate::proto::RecorderStateResponse {
-        recording_since_ms_by_token: state
-            .recording_since_ms_by_token
-            .into_iter()
-            .collect(),
+        recording_since_ms_by_token: state.recording_since_ms_by_token.into_iter().collect(),
         states: state
             .states
             .into_iter()
