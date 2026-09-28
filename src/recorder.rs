@@ -778,12 +778,24 @@ impl AgeRecorder {
                         )
                     })?;
 
+                    let same_shard_tokens = self
+                        .markets
+                        .get(&(market.clone(), shard_id))
+                        .map(|state| state.token_ids.clone())
+                        .unwrap_or_default();
+
                     let mut removed = Vec::new();
                     for token_id in resolving {
+                        let unbounded = token_id == unbounded_source;
+                        let resolved_at_ms = if unbounded || same_shard_tokens.contains(&token_id) {
+                            market_watermark
+                        } else {
+                            None
+                        };
                         if self.complete_token(
                             &token_id,
-                            token_id == unbounded_source,
-                            market_watermark,
+                            unbounded,
+                            resolved_at_ms,
                         )? {
                             removed.push(token_id);
                         }
