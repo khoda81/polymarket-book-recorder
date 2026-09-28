@@ -1,4 +1,4 @@
 include!(concat!(
     env!("OUT_DIR"),
-    "/polymarket_book_recorder.pressure.v7.rs"
+    "/polymarket_book_recorder.pressure.v8.rs"
 ));

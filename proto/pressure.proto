@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package polymarket_book_recorder.pressure.v7;
+package polymarket_book_recorder.pressure.v8;
 
 message PressureLevel {
   uint32 price = 1;

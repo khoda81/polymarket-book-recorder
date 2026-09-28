@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const PRICE_SCALE: u16 = 10_000;
-pub const SNAPSHOT_VERSION: u8 = 7;
+pub const SNAPSHOT_VERSION: u8 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PressureLevel {
@@ -284,6 +284,66 @@ impl PressureFrontierMemory {
             Some(watermark) => self.replace_continuous(&[], watermark),
             None => Ok(false),
         }
+    }
+
+    /// Remap every stored price boundary through one monotone coordinate
+    /// transform. Adjacent source boundaries that map to the same target
+    /// bucket collapse into one run: current shares sum, while the highest
+    /// source boundary supplies the cumulative historical step stack.
+    pub(crate) fn map_prices<F>(&mut self, mut map: F) -> Result<bool>
+    where
+        F: FnMut(u16) -> Result<u16>,
+    {
+        let MemoryState::Observed {
+            valid_through_ms,
+            runs,
+        } = &mut self.state
+        else {
+            return Ok(false);
+        };
+
+        let original = runs.clone();
+        let mut mapped = Vec::<PressureRun>::with_capacity(runs.len());
+        let mut previous_target = 0_u16;
+
+        for run in runs.drain(..) {
+            let target = map(run.price)?;
+            ensure!(
+                target > 0 && target <= PRICE_SCALE,
+                "mapped pressure price must be in [1, {PRICE_SCALE}]"
+            );
+            ensure!(
+                target >= previous_target,
+                "pressure price mapping must be monotone"
+            );
+
+            if let Some(last) = mapped.last_mut()
+                && last.price == target
+            {
+                last.shares += run.shares;
+                ensure!(
+                    last.shares.is_finite(),
+                    "mapped pressure shares must remain finite"
+                );
+                // Frozen steps are cumulative through a price boundary. The
+                // highest source boundary in this collapsed bucket therefore
+                // exactly describes the target boundary's historical stack.
+                last.frozen_steps = run.frozen_steps;
+            } else {
+                mapped.push(PressureRun {
+                    price: target,
+                    shares: run.shares,
+                    frozen_steps: run.frozen_steps,
+                });
+            }
+            previous_target = target;
+        }
+
+        merge_adjacent_runs(&mut mapped);
+        validate_runs(&mapped, *valid_through_ms)?;
+        let changed = mapped != original;
+        *runs = mapped;
+        Ok(changed)
     }
 
     pub fn current_levels(&self) -> Vec<PressureLevel> {
@@ -724,6 +784,53 @@ mod tests {
             }]
         );
         assert_eq!(runs[0].shares, 6.0);
+    }
+
+    #[test]
+    fn monotone_price_mapping_merges_colliding_boundaries_without_losing_history() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[
+                    PressureLevel {
+                        price: 5_000,
+                        shares: 3.0,
+                    },
+                    PressureLevel {
+                        price: 5_001,
+                        shares: 5.0,
+                    },
+                ],
+                1_000,
+            )
+            .unwrap();
+        memory
+            .update_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 1.0,
+                }],
+                2_000,
+            )
+            .unwrap();
+
+        memory
+            .map_prices(|price| Ok(if price <= 5_001 { 5_100 } else { price }))
+            .unwrap();
+
+        let SnapshotState::Observed { runs, .. } = memory.snapshot().state else {
+            panic!("expected observed pressure");
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].price, 5_100);
+        assert_eq!(runs[0].shares, 6.0);
+        assert_eq!(
+            runs[0].frozen_steps,
+            vec![FrozenStep {
+                hi_volume: 8.0,
+                valid_through_ms: 2_000,
+            }]
+        );
     }
 
     #[test]
