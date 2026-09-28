@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::{
+    fees::{FeeSchedule, MarketFeeInfo},
     pressure::{PressureFrontierMemory, PressureFrontierSnapshot},
     pressure_log::{
         RecorderPressureMutation, decode_pressure_mutation, encode_pressure_mutation,
@@ -19,7 +20,7 @@ use crate::{
     },
 };
 
-pub const RECORDER_DATABASE_VERSION: i64 = 7;
+pub const RECORDER_DATABASE_VERSION: i64 = 8;
 pub const RECORDER_CHECKPOINT_MUTATIONS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -223,6 +224,92 @@ impl RecorderStore {
         Ok(pressure)
     }
 
+    pub fn load_market_fees(&self) -> Result<Vec<MarketFeeInfo>> {
+        let inner = self.lock()?;
+        let mut markets = HashMap::<String, (FeeSchedule, Vec<String>)>::new();
+
+        {
+            let mut statement = inner
+                .connection
+                .prepare("SELECT condition_id, rate, exponent FROM market_fee")?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (condition_id, rate, exponent) = row?;
+                let exponent = u32::try_from(exponent)
+                    .context("persisted fee exponent does not fit u32")?;
+                markets.insert(
+                    condition_id,
+                    (FeeSchedule::from_persisted(&rate, exponent)?, Vec::new()),
+                );
+            }
+        }
+
+        {
+            let mut statement = inner
+                .connection
+                .prepare("SELECT token_id, condition_id FROM token_market ORDER BY token_id")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (token_id, condition_id) = row?;
+                let (_, token_ids) = markets.get_mut(&condition_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "token {token_id} references missing fee market {condition_id}"
+                    )
+                })?;
+                token_ids.push(token_id);
+            }
+        }
+
+        Ok(markets
+            .into_iter()
+            .map(|(condition_id, (schedule, token_ids))| MarketFeeInfo {
+                condition_id,
+                schedule,
+                token_ids,
+            })
+            .collect())
+    }
+
+    pub fn save_market_fee(&self, market: &MarketFeeInfo) -> Result<()> {
+        let mut inner = self.lock()?;
+        let transaction = inner.connection.transaction()?;
+        transaction.execute(
+            r#"
+            INSERT INTO market_fee(condition_id, rate, exponent)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(condition_id) DO UPDATE SET
+                rate = excluded.rate,
+                exponent = excluded.exponent
+            "#,
+            params![
+                market.condition_id,
+                market.schedule.rate_string(),
+                i64::from(market.schedule.exponent()),
+            ],
+        )?;
+        for token_id in &market.token_ids {
+            transaction.execute(
+                r#"
+                INSERT INTO token_market(token_id, condition_id)
+                VALUES (?1, ?2)
+                ON CONFLICT(token_id) DO UPDATE SET
+                    condition_id = excluded.condition_id
+                "#,
+                params![token_id, market.condition_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn mutation_count(&self, token_id: &str) -> Result<usize> {
         Ok(self
             .lock()?
@@ -396,7 +483,7 @@ impl RecorderStore {
     }
 }
 
-fn configure_connection(connection: &Connection) -> Result<()> {
+pub(crate) fn configure_connection(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
@@ -447,6 +534,19 @@ fn initialize_database(connection: &mut Connection) -> Result<()> {
                 );
                 CREATE INDEX pressure_log_token_seq_idx
                     ON pressure_log(token_id, seq);
+                CREATE TABLE market_fee (
+                    condition_id TEXT PRIMARY KEY,
+                    rate TEXT NOT NULL,
+                    exponent INTEGER NOT NULL CHECK (exponent >= 0)
+                ) WITHOUT ROWID;
+                CREATE TABLE token_market (
+                    token_id TEXT PRIMARY KEY,
+                    condition_id TEXT NOT NULL,
+                    FOREIGN KEY(condition_id) REFERENCES market_fee(condition_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID;
+                CREATE INDEX token_market_condition_idx
+                    ON token_market(condition_id);
                 PRAGMA user_version = {RECORDER_DATABASE_VERSION};
                 COMMIT;
                 "#
@@ -492,7 +592,7 @@ fn decode_gzip_json(value: &[u8]) -> Result<String> {
     Ok(json)
 }
 
-fn encode_checkpoint(snapshot: &PressureFrontierSnapshot) -> Result<Vec<u8>> {
+pub(crate) fn encode_checkpoint(snapshot: &PressureFrontierSnapshot) -> Result<Vec<u8>> {
     PressureFrontierMemory::restore(snapshot.clone())?;
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -563,6 +663,24 @@ mod tests {
     }
 
     #[test]
+    fn persists_market_fee_metadata() {
+        let temp = tempdir().unwrap();
+        let store = RecorderStore::open(temp.path().join("recorder.sqlite")).unwrap();
+        let market = MarketFeeInfo {
+            condition_id: "condition".into(),
+            schedule: FeeSchedule::from_persisted("0.04", 1).unwrap(),
+            token_ids: vec!["yes".into(), "no".into()],
+        };
+
+        store.save_market_fee(&market).unwrap();
+        let restored = store.load_market_fees().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].condition_id, "condition");
+        assert_eq!(restored[0].schedule, market.schedule);
+        assert_eq!(restored[0].token_ids, vec!["no", "yes"]);
+    }
+
+    #[test]
     fn rejects_v5_database() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("recorder.sqlite");
@@ -577,7 +695,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Recorder database version 5 is unsupported; expected 7")
+                .contains("Recorder database version 5 is unsupported; expected 8")
         );
     }
 }
