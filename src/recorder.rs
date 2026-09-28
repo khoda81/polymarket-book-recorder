@@ -230,8 +230,6 @@ impl TokenState {
 
 }
 
-enum RecorderCommand {}
-
 enum RecorderCommand {
     State {
         token_ids: Vec<String>,
@@ -1147,7 +1145,7 @@ fn dedupe(token_ids: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn short_token(token_id: &str) -> String {fn short_token(token_id: &str) -> String {
+fn short_token(token_id: &str) -> String {
     if token_id.len() <= 12 {
         token_id.to_owned()
     } else {
@@ -1160,7 +1158,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn book_changes_keep_only_ask_pressure() {    #[test]
     fn book_changes_keep_only_ask_pressure() {
         let mut book = AskBook::default();
         let changes = vec![
