@@ -34,3 +34,41 @@ message PressureMutation {
     ReplaceContinuous replace_continuous = 4;
   }
 }
+
+message FrozenStep {
+  double hi_volume = 1;
+  optional int64 valid_through_ms = 2;
+}
+
+message PressureRun {
+  uint32 price = 1;
+  double shares = 2;
+  repeated FrozenStep frozen_steps = 3;
+}
+
+message Unobserved {}
+
+message Observed {
+  optional int64 valid_through_ms = 1;
+  repeated PressureRun runs = 2;
+}
+
+message ResolvedUnbounded {}
+
+message PressureFrontierSnapshot {
+  oneof state {
+    Unobserved unobserved = 1;
+    Observed observed = 2;
+    ResolvedUnbounded resolved_unbounded = 3;
+  }
+}
+
+message TokenPressureState {
+  PressureFrontierSnapshot pressure = 1;
+}
+
+message RecorderStateResponse {
+  map<string, int64> recording_since_ms_by_token = 1;
+  map<string, TokenPressureState> states = 2;
+  repeated string pending_token_ids = 3;
+}
