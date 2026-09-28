@@ -206,7 +206,7 @@ impl PressureFrontierMemory {
     pub fn current_levels(&self) -> Vec<PressureLevel> {
         self.current_levels_map()
             .into_iter()
-            .map(|(key, weight)| PressureLevel { key, weight })
+            .map(|(price, shares)| PressureLevel { price, shares })
             .collect()
     }
 
