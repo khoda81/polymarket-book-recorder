@@ -1,6 +1,6 @@
 use anyhow::{Result, bail, ensure};
 
-use crate::pressure::{PressureLevel, PRICE_SCALE, PressureFrontierMemory, PressureLevel};
+use crate::pressure::{PressureFrontierMemory, PressureLevel, PRICE_SCALE};
 
 const MUTATION_CLEAR: u8 = 0;
 const MUTATION_REPLACE: u8 = 1;

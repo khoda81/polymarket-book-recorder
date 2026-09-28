@@ -266,8 +266,8 @@ fn normalize_levels(levels: &[PressureLevel]) -> BTreeMap<u16, f64> {
 
 fn changed_levels(previous: &BTreeMap<u16, f64>, next: &BTreeMap<u16, f64>) -> BTreeMap<u16, f64> {
     previous
-        .prices()
-        .chain(next.prices())
+        .keys()
+        .chain(next.keys())
         .copied()
         .collect::<BTreeSet<_>>()
         .into_iter()

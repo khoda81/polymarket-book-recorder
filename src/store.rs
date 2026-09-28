@@ -503,7 +503,7 @@ fn encode_checkpoint(snapshot: &PressureFrontierSnapshot) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pressure::{PressureLevel, PressureLevel};
+    use crate::pressure::PressureLevel;
     use tempfile::tempdir;
 
     fn one_level_memory() -> PressureFrontierMemory {
