@@ -403,6 +403,17 @@ mod tests {
                 shares: 4.0,
             }]
         );
+        let migrated = serde_json::to_value(memory.snapshot()).unwrap();
+        assert_eq!(migrated["version"], 8);
+        assert_eq!(migrated["state"]["runs"][0]["price"], 5_100);
+        assert_eq!(
+            migrated["state"]["runs"][0]["frozenSteps"][0]["hiVolume"],
+            10.0
+        );
+        assert_eq!(
+            migrated["state"]["runs"][0]["frozenSteps"][0]["validThroughMs"],
+            2_000
+        );
         assert_eq!(store.stats().unwrap().pressure_log_mutations, 0);
 
         let persisted = store.load_market_fees().unwrap();
