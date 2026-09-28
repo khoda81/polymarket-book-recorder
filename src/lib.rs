@@ -1,7 +1,6 @@
 pub mod api;
 pub mod book;
 pub mod fees;
-pub mod migration_v7;
 pub mod polymarket;
 pub mod pressure;
 pub mod pressure_log;
