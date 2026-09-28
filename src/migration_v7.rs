@@ -390,7 +390,7 @@ impl MigrationProgress {
             if self.done == self.total || self.last_draw.elapsed() >= Self::DRAW_INTERVAL {
                 self.draw();
             }
-        } else if self.done % 100 == 0 || self.done == self.total {
+        } else if self.done.is_multiple_of(100) || self.done == self.total {
             let elapsed = self.started.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 {
                 self.done as f64 / elapsed
