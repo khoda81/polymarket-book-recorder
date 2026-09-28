@@ -478,7 +478,7 @@ fn load_mutation_counts(connection: &Connection) -> Result<HashMap<String, usize
 fn decode_checkpoint(value: &[u8]) -> Result<PressureFrontierSnapshot> {
     let json = decode_gzip_json(value)?;
     let snapshot: PressureFrontierSnapshot =
-        serde_json::from_str(&json).context("parsing v6 pressure checkpoint JSON")?;
+        serde_json::from_str(&json).context("parsing pressure checkpoint JSON")?;
     PressureFrontierMemory::restore(snapshot.clone())?;
     Ok(snapshot)
 }
