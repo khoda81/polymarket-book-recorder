@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
-use crate::pressure::{PRICE_SCALE, PressureLevel};
+use crate::{
+    fees::FeeSchedule,
+    pressure::{PRICE_SCALE, PressureLevel},
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawBookLevel {
@@ -40,12 +43,45 @@ impl AskBook {
         Ok(())
     }
 
-    pub fn pressure_levels(&self) -> Vec<PressureLevel> {
-        self.levels
-            .iter()
-            .filter(|(price, _)| **price > 0)
-            .map(|(&price, &shares)| PressureLevel { price, shares })
-            .collect()
+    /// Project the raw venue book into fee-adjusted taker-price space.
+    ///
+    /// Multiple raw prices may quantize into the same effective 1e-4 bucket;
+    /// they are one pressure level and their shares are summed.
+    pub fn pressure_levels(&self, fee: FeeSchedule) -> Result<Vec<PressureLevel>> {
+        let mut projected = BTreeMap::<u16, f64>::new();
+        for (&raw_price, &shares) in &self.levels {
+            if raw_price == 0 {
+                continue;
+            }
+            let price = fee.effective_ask_tick(raw_price)?;
+            *projected.entry(price).or_default() += shares;
+        }
+        Ok(projected
+            .into_iter()
+            .map(|(price, shares)| PressureLevel { price, shares })
+            .collect())
+    }
+
+    /// Aggregate the current shares at one effective bucket.
+    pub fn pressure_level_at(
+        &self,
+        effective_price: u16,
+        fee: FeeSchedule,
+    ) -> Result<PressureLevel> {
+        ensure!(
+            effective_price > 0 && effective_price <= PRICE_SCALE,
+            "effective pressure price must be in [1, {PRICE_SCALE}]"
+        );
+        let mut shares = 0.0;
+        for (&raw_price, &raw_shares) in &self.levels {
+            if raw_price > 0 && fee.effective_ask_tick(raw_price)? == effective_price {
+                shares += raw_shares;
+            }
+        }
+        Ok(PressureLevel {
+            price: effective_price,
+            shares,
+        })
     }
 
     pub fn apply_change(
@@ -53,7 +89,7 @@ impl AskBook {
         side: &str,
         price: &str,
         size: &str,
-    ) -> Result<Option<PressureLevel>> {
+    ) -> Result<Option<u16>> {
         match side {
             // Bids belong to the reverse token edge. They still matter as an
             // observation timestamp to PressureFrontierMemory, but there is no
@@ -63,7 +99,7 @@ impl AskBook {
                 let price = parse_price(price)?;
                 let shares = parse_shares(size)?;
                 self.set_level(price, shares)?;
-                Ok((price > 0).then_some(PressureLevel { price, shares }))
+                Ok((price > 0).then_some(price))
             }
             other => bail!("unsupported order side: {other}"),
         }
@@ -137,26 +173,58 @@ mod tests {
     }
 
     #[test]
-    fn ask_book_ignores_bids_but_applies_sells() {
+    fn ask_book_keeps_raw_prices_but_projects_effective_pressure() {
+        let fee = FeeSchedule::new("0.04".parse().unwrap(), 1).unwrap();
         let mut book = AskBook::default();
         assert_eq!(book.apply_change("BUY", "0.5", "12").unwrap(), None);
 
         assert_eq!(
             book.apply_change("SELL", "0.5", "12").unwrap(),
-            Some(PressureLevel {
-                price: 5_000,
-                shares: 12.0,
-            })
+            Some(5_000)
         );
         assert_eq!(
-            book.pressure_levels(),
+            book.pressure_levels(fee).unwrap(),
             vec![PressureLevel {
-                price: 5_000,
+                price: 5_100,
                 shares: 12.0,
             }]
         );
 
         book.apply_change("SELL", "0.5", "0").unwrap();
-        assert!(book.pressure_levels().is_empty());
+        assert!(book.pressure_levels(fee).unwrap().is_empty());
+    }
+
+    #[test]
+    fn effective_tick_collisions_sum_raw_levels() {
+        let fee = FeeSchedule::new("0.04".parse().unwrap(), 1).unwrap();
+        let mut book = AskBook::default();
+
+        // Find two adjacent raw ticks that collide after effective-price
+        // quantization; the projection must expose one aggregate level.
+        let pair = (1..PRICE_SCALE)
+            .find(|&raw| {
+                fee.effective_ask_tick(raw).unwrap()
+                    == fee.effective_ask_tick(raw + 1).unwrap()
+            })
+            .expect("real fee curve should contain a quantization collision");
+
+        book.set_level(pair, 3.0).unwrap();
+        book.set_level(pair + 1, 5.0).unwrap();
+
+        let effective = fee.effective_ask_tick(pair).unwrap();
+        assert_eq!(
+            book.pressure_levels(fee).unwrap(),
+            vec![PressureLevel {
+                price: effective,
+                shares: 8.0,
+            }]
+        );
+        assert_eq!(
+            book.pressure_level_at(effective, fee).unwrap(),
+            PressureLevel {
+                price: effective,
+                shares: 8.0,
+            }
+        );
     }
 }
