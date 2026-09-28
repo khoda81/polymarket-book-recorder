@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 pub const PRICE_SCALE: u16 = 10_000;
 pub const SNAPSHOT_VERSION: u8 = 7;
-const LEGACY_SNAPSHOT_VERSION: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PressureLevel {
@@ -13,7 +12,7 @@ pub struct PressureLevel {
     pub shares: f64,
 }
 
-/// Opaque persisted pressure state (v7, with v6 restore compatibility).
+/// Opaque persisted pressure state.
 ///
 /// Current order-book levels live exactly once, as per-price shares in the
 /// runs. Cumulative current pressure is derived by prefix-summing those shares.
@@ -34,10 +33,7 @@ enum SnapshotState {
         valid_through_ms: i64,
         runs: Vec<PressureRun>,
     },
-    ResolvedUnbounded {
-        #[serde(rename = "resolvedAtMs")]
-        resolved_at_ms: Option<i64>,
-    },
+    ResolvedUnbounded,
 }
 
 /// One explicit price boundary in the pressure surface.
@@ -72,9 +68,7 @@ enum MemoryState {
         valid_through_ms: i64,
         runs: Vec<PressureRun>,
     },
-    ResolvedUnbounded {
-        resolved_at_ms: Option<i64>,
-    },
+    ResolvedUnbounded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,11 +87,10 @@ impl Default for PressureFrontierMemory {
 impl PressureFrontierMemory {
     pub fn restore(snapshot: PressureFrontierSnapshot) -> Result<Self> {
         ensure!(
-            snapshot.version == LEGACY_SNAPSHOT_VERSION || snapshot.version == SNAPSHOT_VERSION,
+            snapshot.version == SNAPSHOT_VERSION,
             "unsupported pressure frontier snapshot version: {}",
             snapshot.version
         );
-        let snapshot_version = snapshot.version;
 
         let state = match snapshot.state {
             SnapshotState::Unobserved => MemoryState::Unobserved,
@@ -111,19 +104,7 @@ impl PressureFrontierMemory {
                     runs,
                 }
             }
-            SnapshotState::ResolvedUnbounded { resolved_at_ms } => {
-                ensure!(
-                    snapshot_version == SNAPSHOT_VERSION,
-                    "resolved-unbounded pressure requires snapshot version {SNAPSHOT_VERSION}"
-                );
-                if let Some(resolved_at_ms) = resolved_at_ms {
-                    ensure!(
-                        resolved_at_ms >= 0,
-                        "pressure unbounded resolution timestamp must be non-negative"
-                    );
-                }
-                MemoryState::ResolvedUnbounded { resolved_at_ms }
-            }
+            SnapshotState::ResolvedUnbounded => MemoryState::ResolvedUnbounded,
         };
 
         Ok(Self { state })
@@ -139,9 +120,7 @@ impl PressureFrontierMemory {
                 valid_through_ms: *valid_through_ms,
                 runs: runs.clone(),
             },
-            MemoryState::ResolvedUnbounded { resolved_at_ms } => SnapshotState::ResolvedUnbounded {
-                resolved_at_ms: *resolved_at_ms,
-            },
+            MemoryState::ResolvedUnbounded => SnapshotState::ResolvedUnbounded,
         };
         PressureFrontierSnapshot {
             version: SNAPSHOT_VERSION,
@@ -149,11 +128,7 @@ impl PressureFrontierMemory {
         }
     }
 
-    pub(crate) fn clear_legacy(&mut self) {
-        self.state = MemoryState::Unobserved;
-    }
-
-    /// Install a complete observation without claiming continuity from the
+    /// Install a complete observation without claiming continuity from the    /// Install a complete observation without claiming continuity from the
     /// previous current frontier to this observation.
     pub fn observe_levels(
         &mut self,
@@ -222,73 +197,7 @@ impl PressureFrontierMemory {
         Ok(true)
     }
 
-    /// Replay a v6 full-book observation. v6 persisted the raw event
-    /// timestamp even though its in-memory state max-aggregated time.
-    pub(crate) fn replay_legacy_v6_replace(
-        &mut self,
-        levels: &[PressureLevel],
-        valid_through_ms: i64,
-    ) -> Result<bool> {
-        self.ensure_mutable()?;
-        ensure!(
-            valid_through_ms >= 0,
-            "pressure frontier timestamp must be non-negative"
-        );
-        let valid_through_ms = self
-            .valid_through_ms()
-            .map_or(valid_through_ms, |previous| previous.max(valid_through_ms));
-        self.observe_levels(levels, valid_through_ms)
-    }
-
-    /// Replay the old v6 mutation semantics exactly. Legacy deltas did not
-    /// prove continuity up to their own timestamp: disappearing pressure froze
-    /// at the previously known watermark, then the surviving frontier advanced.
-    pub(crate) fn replay_legacy_v6_update(
-        &mut self,
-        changes: &[PressureLevel],
-        valid_through_ms: i64,
-    ) -> Result<bool> {
-        self.ensure_mutable()?;
-        ensure!(
-            valid_through_ms >= 0,
-            "pressure frontier timestamp must be non-negative"
-        );
-        let valid_through_ms = self
-            .valid_through_ms()
-            .map_or(valid_through_ms, |previous| previous.max(valid_through_ms));
-
-        let previous = self.current_levels_map();
-        let mut changed = BTreeMap::<u16, f64>::new();
-        for change in changes {
-            if change.price == 0
-                || change.price > PRICE_SCALE
-                || !change.shares.is_finite()
-                || change.shares < 0.0
-            {
-                continue;
-            }
-
-            let old_shares = previous.get(&change.price).copied().unwrap_or(0.0);
-            if !same_volume(change.shares, old_shares) {
-                changed.insert(change.price, change.shares);
-            }
-        }
-
-        let previous_time = self.valid_through_ms();
-        if changed.is_empty() {
-            return self.observe_through(valid_through_ms);
-        }
-
-        let mut runs = self.take_runs();
-        apply_level_changes(&mut runs, &changed, previous_time)?;
-        self.state = MemoryState::Observed {
-            valid_through_ms,
-            runs,
-        };
-        Ok(true)
-    }
-
-    /// Replace the complete frontier on a continuous ordered stream.
+    /// Replace the complete frontier on a continuous ordered stream.    /// Replace the complete frontier on a continuous ordered stream.
     pub fn replace_continuous(
         &mut self,
         levels: &[PressureLevel],
@@ -300,7 +209,7 @@ impl PressureFrontierMemory {
     }
 
     pub fn observe_through(&mut self, valid_through_ms: i64) -> Result<bool> {
-        if matches!(self.state, MemoryState::ResolvedUnbounded { .. }) {
+        if matches!(self.state, MemoryState::ResolvedUnbounded) {
             return Ok(false);
         }
         let valid_through_ms = self.require_monotonic_time(valid_through_ms)?;
@@ -314,37 +223,19 @@ impl PressureFrontierMemory {
     }
 
     /// Terminal unbounded pressure dominates every finite historical offer.
-    pub fn resolve_unbounded(&mut self, resolved_at_ms: Option<i64>) -> Result<bool> {
-        if let Some(resolved_at_ms) = resolved_at_ms {
-            self.require_monotonic_time(resolved_at_ms)?;
+    pub fn resolve_unbounded(&mut self) -> bool {
+        if matches!(self.state, MemoryState::ResolvedUnbounded) {
+            return false;
         }
-
-        if let MemoryState::ResolvedUnbounded {
-            resolved_at_ms: previous,
-        } = &self.state
-        {
-            let previous = *previous;
-            let next = match (previous, resolved_at_ms) {
-                (Some(previous), Some(next)) => Some(previous.max(next)),
-                (Some(previous), None) => Some(previous),
-                (None, next) => next,
-            };
-            let changed = next != previous;
-            self.state = MemoryState::ResolvedUnbounded {
-                resolved_at_ms: next,
-            };
-            return Ok(changed);
-        }
-
-        self.state = MemoryState::ResolvedUnbounded { resolved_at_ms };
-        Ok(true)
+        self.state = MemoryState::ResolvedUnbounded;
+        true
     }
 
     /// Resolution away from this semantic token removes only future/current
     /// liquidity. With no resolution timestamp, freeze only through the latest
     /// watermark already proven.
     pub fn resolve_zero_future(&mut self, resolved_at_ms: Option<i64>) -> Result<bool> {
-        if matches!(self.state, MemoryState::ResolvedUnbounded { .. }) {
+        if matches!(self.state, MemoryState::ResolvedUnbounded) {
             return Ok(false);
         }
 
@@ -368,7 +259,7 @@ impl PressureFrontierMemory {
 
     fn current_levels_map(&self) -> BTreeMap<u16, f64> {
         let runs = match &self.state {
-            MemoryState::Unobserved | MemoryState::ResolvedUnbounded { .. } => {
+            MemoryState::Unobserved | MemoryState::ResolvedUnbounded => {
                 return BTreeMap::new();
             }
             MemoryState::Observed { runs, .. } => runs,
@@ -386,17 +277,17 @@ impl PressureFrontierMemory {
             MemoryState::Observed {
                 valid_through_ms, ..
             } => Some(*valid_through_ms),
-            MemoryState::ResolvedUnbounded { resolved_at_ms } => *resolved_at_ms,
+            MemoryState::ResolvedUnbounded => None,
         }
     }
 
     pub fn is_resolved_unbounded(&self) -> bool {
-        matches!(self.state, MemoryState::ResolvedUnbounded { .. })
+        matches!(self.state, MemoryState::ResolvedUnbounded)
     }
 
     fn ensure_mutable(&self) -> Result<()> {
         ensure!(
-            !matches!(self.state, MemoryState::ResolvedUnbounded { .. }),
+            !matches!(self.state, MemoryState::ResolvedUnbounded),
             "resolved unbounded pressure is terminal"
         );
         Ok(())
@@ -420,7 +311,7 @@ impl PressureFrontierMemory {
         match std::mem::replace(&mut self.state, MemoryState::Unobserved) {
             MemoryState::Unobserved => Vec::new(),
             MemoryState::Observed { runs, .. } => runs,
-            MemoryState::ResolvedUnbounded { .. } => {
+            MemoryState::ResolvedUnbounded => {
                 unreachable!("terminal pressure cannot expose mutable runs")
             }
         }
@@ -877,15 +768,13 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        memory.resolve_unbounded(Some(2_000)).unwrap();
+        assert!(memory.resolve_unbounded());
 
         assert!(memory.is_resolved_unbounded());
         assert!(memory.current_levels().is_empty());
         assert_eq!(
             memory.snapshot().state,
-            SnapshotState::ResolvedUnbounded {
-                resolved_at_ms: Some(2_000),
-            }
+            SnapshotState::ResolvedUnbounded
         );
         assert_eq!(
             PressureFrontierMemory::restore(memory.snapshot()).unwrap(),
