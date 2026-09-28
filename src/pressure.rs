@@ -222,6 +222,24 @@ impl PressureFrontierMemory {
         Ok(true)
     }
 
+    /// Replay a v6 full-book observation. v6 persisted the raw event
+    /// timestamp even though its in-memory state max-aggregated time.
+    pub(crate) fn replay_legacy_v6_replace(
+        &mut self,
+        levels: &[PressureLevel],
+        valid_through_ms: i64,
+    ) -> Result<bool> {
+        self.ensure_mutable()?;
+        ensure!(
+            valid_through_ms >= 0,
+            "pressure frontier timestamp must be non-negative"
+        );
+        let valid_through_ms = self
+            .valid_through_ms()
+            .map_or(valid_through_ms, |previous| previous.max(valid_through_ms));
+        self.observe_levels(levels, valid_through_ms)
+    }
+
     /// Replay the old v6 mutation semantics exactly. Legacy deltas did not
     /// prove continuity up to their own timestamp: disappearing pressure froze
     /// at the previously known watermark, then the surviving frontier advanced.
@@ -231,7 +249,13 @@ impl PressureFrontierMemory {
         valid_through_ms: i64,
     ) -> Result<bool> {
         self.ensure_mutable()?;
-        let valid_through_ms = self.require_monotonic_time(valid_through_ms)?;
+        ensure!(
+            valid_through_ms >= 0,
+            "pressure frontier timestamp must be non-negative"
+        );
+        let valid_through_ms = self
+            .valid_through_ms()
+            .map_or(valid_through_ms, |previous| previous.max(valid_through_ms));
 
         let previous = self.current_levels_map();
         let mut changed = BTreeMap::<u16, f64>::new();
