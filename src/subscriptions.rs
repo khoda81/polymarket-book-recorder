@@ -31,12 +31,14 @@ const HEARTBEAT_STALE: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub enum SubscriptionEvent {
     Market {
+        shard_id: u64,
         event: MarketEvent,
         /// Present only for the first book snapshot caused by a subscribe.
         /// This send time is a causal lower bound on snapshot generation.
         snapshot_requested_at_ms: Option<i64>,
     },
     ContinuityLost {
+        shard_id: u64,
         token_ids: Vec<String>,
     },
 }
@@ -403,6 +405,7 @@ async fn run_shard(
                                 };
                                 if event_tx
                                     .send(SubscriptionEvent::Market {
+                                        shard_id,
                                         event,
                                         snapshot_requested_at_ms,
                                     })
@@ -432,6 +435,7 @@ async fn run_shard(
         if !token_ids.is_empty() {
             let _ = event_tx
                 .send(SubscriptionEvent::ContinuityLost {
+                    shard_id,
                     token_ids: token_ids.iter().cloned().collect(),
                 })
                 .await;
