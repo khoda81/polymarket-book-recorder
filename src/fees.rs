@@ -116,24 +116,78 @@ pub struct MarketFeeInfo {
     pub token_ids: Vec<String>,
 }
 
-#[derive(Clone)]
-pub struct FeeLookup {
-    client: Client,
-    base_url: String,
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
-impl FeeLookup {
-    pub async fn resolve_token(&self, token_id: &str) -> Result<MarketFeeInfo> {
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+pub struct FeeResolver {
+    client: Client,
+    base_url: String,
+    by_market: HashMap<String, MarketFeeInfo>,
+    market_by_token: HashMap<String, String>,
+}
+
+impl FeeResolver {
+    pub fn new() -> Self {
+        Self::with_base_url(DEFAULT_CLOB_REST_URL)
+    }
+
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            by_market: HashMap::new(),
+            market_by_token: HashMap::new(),
+        }
+    }
+
+    pub fn seed(&mut self, market: MarketFeeInfo) {
+        for token_id in &market.token_ids {
+            self.market_by_token
+                .insert(token_id.clone(), market.condition_id.clone());
+        }
+        self.by_market.insert(market.condition_id.clone(), market);
+    }
+
+    pub fn cached_for_token(&self, token_id: &str) -> Option<&MarketFeeInfo> {
+        let condition_id = self.market_by_token.get(token_id)?;
+        self.by_market.get(condition_id)
+    }
+
+    pub async fn resolve_token(&mut self, token_id: &str) -> Result<MarketFeeInfo> {
+        if let Some(market) = self.cached_for_token(token_id) {
+            return Ok(market.clone());
+        }
+
+        let market = self.resolve_token_uncached(token_id).await?;
+        self.seed(market.clone());
+        Ok(market)
+    }
+
+    async fn resolve_token_uncached(&self, token_id: &str) -> Result<MarketFeeInfo> {
         let response = self
             .get_json::<MarketByTokenWire>(
                 &format!("/markets-by-token/{token_id}"),
                 "resolving Polymarket market by token",
             )
             .await?;
-        self.fetch_market(&response.condition_id).await
+        self.fetch_market_uncached(&response.condition_id).await
     }
 
-    pub async fn fetch_market(&self, condition_id: &str) -> Result<MarketFeeInfo> {
+    async fn fetch_market_uncached(&self, condition_id: &str) -> Result<MarketFeeInfo> {
         let response = self
             .get_json::<MarketInfoWire>(
                 &format!("/clob-markets/{condition_id}"),
@@ -205,100 +259,6 @@ impl FeeLookup {
         }
 
         unreachable!("retry loop always returns on its final attempt")
-    }
-}
-
-fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
-}
-
-fn retry_after(response: &reqwest::Response) -> Option<Duration> {
-    response
-        .headers()
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
-}
-
-pub struct FeeResolver {
-    client: Client,
-    base_url: String,
-    by_market: HashMap<String, MarketFeeInfo>,
-    market_by_token: HashMap<String, String>,
-}
-
-impl FeeResolver {
-    pub fn new() -> Self {
-        Self::with_base_url(DEFAULT_CLOB_REST_URL)
-    }
-
-    pub fn with_base_url(base_url: impl Into<String>) -> Self {
-        Self {
-            client: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            by_market: HashMap::new(),
-            market_by_token: HashMap::new(),
-        }
-    }
-
-    pub fn seed(&mut self, market: MarketFeeInfo) {
-        for token_id in &market.token_ids {
-            self.market_by_token
-                .insert(token_id.clone(), market.condition_id.clone());
-        }
-        self.by_market.insert(market.condition_id.clone(), market);
-    }
-
-    pub fn cached_for_market(&self, condition_id: &str) -> Option<&MarketFeeInfo> {
-        self.by_market.get(condition_id)
-    }
-
-    pub fn cached_for_token(&self, token_id: &str) -> Option<&MarketFeeInfo> {
-        let condition_id = self.market_by_token.get(token_id)?;
-        self.by_market.get(condition_id)
-    }
-
-    pub fn lookup(&self) -> FeeLookup {
-        FeeLookup {
-            client: self.client.clone(),
-            base_url: self.base_url.clone(),
-        }
-    }
-
-    pub async fn resolve_token(&mut self, token_id: &str) -> Result<MarketFeeInfo> {
-        if let Some(market) = self.cached_for_token(token_id) {
-            return Ok(market.clone());
-        }
-
-        let market = self.lookup().resolve_token(token_id).await?;
-        self.seed(market.clone());
-        Ok(market)
-    }
-
-    pub async fn fetch_market(&mut self, condition_id: &str) -> Result<MarketFeeInfo> {
-        if let Some(market) = self.cached_for_market(condition_id) {
-            return Ok(market.clone());
-        }
-
-        let market = self.lookup().fetch_market(condition_id).await?;
-        self.seed(market.clone());
-        Ok(market)
-    }
-
-    pub async fn refresh_market(&mut self, condition_id: &str) -> Result<(MarketFeeInfo, bool)> {
-        let market = self.lookup().fetch_market(condition_id).await?;
-        let changed = self
-            .by_market
-            .get(condition_id)
-            .is_some_and(|old| old.schedule != market.schedule);
-
-        self.seed(market.clone());
-        Ok((market, changed))
     }
 }
 
