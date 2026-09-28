@@ -2,8 +2,9 @@
 
 Rust recorder backend for [Polymarket Viz](https://github.com/khoda81/polymarket-book-vis).
 
-The recorder persists canonical pressure state in SQLite schema version 7.
-Older database schemas are rejected.
+The recorder persists canonical pressure state in SQLite schema version 8.
+Opening a schema-v7 database performs the one-shot raw-price → effective-price
+migration before recording starts. Other older database schemas are rejected.
 
 ## Features
 
@@ -14,14 +15,18 @@ Older database schemas are rejected.
 - market-local, stream-local watermark propagation from ordered market events
 - terminal unbounded pressure for resolved winners, with dominated history
   removed and opposing historical pressure preserved
-- exact integer price ticks
-- token-local ask-book pressure tracking
-- v7 pressure history as exact per-price current shares + frozen cumulative upper-edge steps
+- exact integer price ticks representing upper edges of 1e-4 price buckets
+- raw Polymarket ask books retained only in transient memory
+- authoritative per-market fee schedules from CLOB market metadata
+- taker BUY prices projected to fee-adjusted effective collateral/share before pressure recording
+- raw levels colliding in one effective-price tick are aggregated before entering pressure state
+- v8 pressure history as exact per-price current shares + frozen cumulative upper-edge steps
 - cumulative current pressure derived by prefix sum; lower historical edges are implicit
 - no duplicated current frontier and no persisted lower band edges
-- SQLite schema version 7
+- SQLite schema version 8
 - gzip-compressed pressure checkpoints
 - protobuf pressure mutation tails with explicit oneof semantics and integer millisecond timestamps
+- persisted token→condition and condition→fee metadata
 - gzip-compressed JSON checkpoints + protobuf tail replay
 - incremental writeback with a checkpoint every 512 mutations
 - `GET /api/recorder/health`
