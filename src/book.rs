@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
-use crate::pressure::{PressureLevel, PRICE_SCALE, PressureLevel};
+use crate::pressure::{PressureLevel, PRICE_SCALE};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawBookLevel {
