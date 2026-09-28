@@ -23,6 +23,13 @@ struct Args {
     /// HTTP API port.
     #[arg(long, default_value_t = 3001)]
     port: u16,
+
+    /// Maximum concurrent Polymarket REST requests during v7 -> v8 migration.
+    #[arg(
+        long,
+        default_value_t = migration_v7::DEFAULT_MIGRATION_CONCURRENCY
+    )]
+    migration_concurrency: usize,
 }
 
 #[tokio::main]
@@ -44,7 +51,12 @@ async fn main() -> Result<()> {
         .init();
 
     let mut fees = FeeResolver::new();
-    migration_v7::migrate_database_v7_to_v8(&args.database, &mut fees).await?;
+    migration_v7::migrate_database_v7_to_v8(
+        &args.database,
+        &mut fees,
+        args.migration_concurrency,
+    )
+    .await?;
 
     let store = Arc::new(RecorderStore::open(&args.database)?);
     for market in store.load_market_fees()? {
