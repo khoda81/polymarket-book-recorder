@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -15,9 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     book::AskBook,
-    polymarket::{
-        MarketEvent, PolymarketRestClient, RawOrderBook, RawPriceChange, event_timestamp_ms,
-    },
+    polymarket::{MarketEvent, RawPriceChange},
     pressure::{PressureFrontierMemory, PressureFrontierSnapshot, PressureLevel},
     pressure_log::RecorderPressureMutation,
     store::{
@@ -27,8 +25,6 @@ use crate::{
 };
 
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(1);
-const REST_SEED_BATCH_TOKENS: usize = 20;
-const REST_SEED_RETRY: Duration = Duration::from_secs(5);
 const EVENT_CHANNEL_CAPACITY: usize = 16_384;
 const COMMAND_CHANNEL_CAPACITY: usize = 128;
 
@@ -64,17 +60,10 @@ pub struct RecorderStats {
     pub database_path: String,
 }
 
-#[derive(Debug)]
-struct BufferedPriceChangeEvent {
-    timestamp_ms: i64,
-    changes: Vec<RawPriceChange>,
-}
-
-#[derive(Debug)]
-struct SeedResult {
-    token_ids: Vec<String>,
-    requested_at_ms: i64,
-    result: std::result::Result<Vec<RawOrderBook>, String>,
+#[derive(Debug, Default)]
+struct MarketState {
+    token_ids: BTreeSet<String>,
+    watermark_ms: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -123,37 +112,11 @@ impl PressureState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum BookState {
-    Unhydrated {
-        buffered: Vec<BufferedPriceChangeEvent>,
-    },
+    #[default]
+    Unhydrated,
     Live(AskBook),
-}
-
-impl Default for BookState {
-    fn default() -> Self {
-        Self::Unhydrated {
-            buffered: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SeedState {
-    Idle,
-    InFlight,
-    RetryAfter(i64),
-}
-
-impl SeedState {
-    fn ready(self, now_ms: i64) -> bool {
-        match self {
-            Self::Idle => true,
-            Self::InFlight => false,
-            Self::RetryAfter(retry_after_ms) => retry_after_ms <= now_ms,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -162,7 +125,6 @@ struct WatchedTokenState {
     pressure: PressureState,
     book: BookState,
     pending_pressure_mutations: Vec<RecorderPressureMutation>,
-    seed: SeedState,
 }
 
 impl WatchedTokenState {
@@ -172,7 +134,6 @@ impl WatchedTokenState {
             pressure,
             book: BookState::default(),
             pending_pressure_mutations: Vec::new(),
-            seed: SeedState::Idle,
         }
     }
 }
@@ -267,36 +228,9 @@ impl TokenState {
         }
     }
 
-    fn complete(self) -> (Self, bool) {
-        match self {
-            Self::Watched(mut state) => {
-                if let Some(memory) = state.pressure.memory_mut() {
-                    memory.clear();
-                    state
-                        .pending_pressure_mutations
-                        .push(RecorderPressureMutation::Clear);
-                }
-                (
-                    Self::Completed(CompletedTokenState {
-                        recording_since_ms: state.recording_since_ms,
-                        pressure: state.pressure,
-                        pending_pressure_mutations: state.pending_pressure_mutations,
-                    }),
-                    true,
-                )
-            }
-            Self::Completed(mut state) => {
-                if let Some(memory) = state.pressure.memory_mut() {
-                    memory.clear();
-                    state
-                        .pending_pressure_mutations
-                        .push(RecorderPressureMutation::Clear);
-                }
-                (Self::Completed(state), false)
-            }
-        }
-    }
 }
+
+enum RecorderCommand {}
 
 enum RecorderCommand {
     State {
@@ -398,16 +332,12 @@ pub async fn start(store: Arc<RecorderStore>) -> Result<RecorderRuntime> {
     let index = store.load_index()?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (subscription_tx, subscription_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let (seed_tx, seed_rx) = mpsc::channel(128);
 
     let mut recorder = AgeRecorder::new(
         store,
-        PolymarketRestClient::default(),
         SubscriptionPool::new(subscription_tx),
         command_rx,
         subscription_rx,
-        seed_tx,
-        seed_rx,
     );
 
     for record in index {
@@ -437,37 +367,29 @@ pub async fn start(store: Arc<RecorderStore>) -> Result<RecorderRuntime> {
 
 struct AgeRecorder {
     store: Arc<RecorderStore>,
-    rest: PolymarketRestClient,
     subscriptions: SubscriptionPool,
     tokens: HashMap<String, TokenState>,
+    markets: HashMap<String, MarketState>,
     dirty: BTreeSet<String>,
     command_rx: mpsc::Receiver<RecorderCommand>,
     subscription_rx: mpsc::Receiver<SubscriptionEvent>,
-    seed_tx: mpsc::Sender<SeedResult>,
-    seed_rx: mpsc::Receiver<SeedResult>,
 }
 
 impl AgeRecorder {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         store: Arc<RecorderStore>,
-        rest: PolymarketRestClient,
         subscriptions: SubscriptionPool,
         command_rx: mpsc::Receiver<RecorderCommand>,
         subscription_rx: mpsc::Receiver<SubscriptionEvent>,
-        seed_tx: mpsc::Sender<SeedResult>,
-        seed_rx: mpsc::Receiver<SeedResult>,
     ) -> Self {
         Self {
             store,
-            rest,
             subscriptions,
             tokens: HashMap::new(),
+            markets: HashMap::new(),
             dirty: BTreeSet::new(),
             command_rx,
             subscription_rx,
-            seed_tx,
-            seed_rx,
         }
     }
 
@@ -493,13 +415,6 @@ impl AgeRecorder {
                         && let Err(error) = self.consume_subscription_event(event).await
                     {
                         error!(?error, "could not consume Polymarket event");
-                    }
-                }
-                seed = self.seed_rx.recv() => {
-                    if let Some(seed) = seed
-                        && let Err(error) = self.consume_seed_result(seed)
-                    {
-                        error!(?error, "could not consume REST seed");
                     }
                 }
                 _ = persist.tick() => {
@@ -583,7 +498,6 @@ impl AgeRecorder {
     ) -> Result<RecorderStateResponse> {
         let requested = dedupe(token_ids);
         self.watch(requested.clone()).await;
-        self.seed_pending(&requested);
 
         let mut states = BTreeMap::new();
         if include_states {
@@ -685,132 +599,12 @@ impl AgeRecorder {
         })
     }
 
-    fn seed_pending(&mut self, token_ids: &[String]) {
-        let now = now_ms();
-        let candidates = token_ids
-            .iter()
-            .filter(|token_id| {
-                self.tokens.get(*token_id).is_some_and(|state| {
-                    matches!(
-                        state,
-                        TokenState::Watched(WatchedTokenState {
-                            pressure: PressureState::Missing,
-                            seed,
-                            ..
-                        }) if seed.ready(now)
-                    )
-                })
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-
-        for batch in candidates
-            .into_iter()
-            .collect::<Vec<_>>()
-            .chunks(REST_SEED_BATCH_TOKENS)
-        {
-            let token_ids = batch.to_vec();
-            for token_id in &token_ids {
-                if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
-                    state.seed = SeedState::InFlight;
-                }
-            }
-
-            let rest = self.rest.clone();
-            let seed_tx = self.seed_tx.clone();
-            tokio::spawn(async move {
-                let requested_at_ms = now_ms();
-                let result = rest
-                    .fetch_order_books(&token_ids)
-                    .await
-                    .map_err(|error| error.to_string());
-                let _ = seed_tx
-                    .send(SeedResult {
-                        token_ids,
-                        requested_at_ms,
-                        result,
-                    })
-                    .await;
-            });
-        }
-    }
-
-    fn consume_seed_result(&mut self, seed: SeedResult) -> Result<()> {
-        let SeedResult {
-            token_ids,
-            requested_at_ms,
-            result,
-        } = seed;
-
-        match result {
-            Ok(snapshots) => {
-                for token_id in &token_ids {
-                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
-                        state.seed = SeedState::Idle;
-                    }
-                }
-
-                for snapshot in snapshots {
-                    let token_id = snapshot.asset_id.clone();
-                    let buffered = {
-                        let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id)
-                        else {
-                            continue;
-                        };
-                        if state.pressure.memory().is_some() {
-                            continue;
-                        }
-                        match &mut state.book {
-                            BookState::Unhydrated { buffered } => std::mem::take(buffered),
-                            BookState::Live(_) => Vec::new(),
-                        }
-                    };
-
-                    let snapshot_ms = requested_at_ms.max(event_timestamp_ms(
-                        snapshot.timestamp.as_ref(),
-                        requested_at_ms,
-                    ));
-                    let mut book = AskBook::from_snapshot(&snapshot.asks)?;
-                    let levels = book.pressure_levels();
-                    self.update_memory_replace(&token_id, levels, snapshot_ms)?;
-
-                    for event in buffered {
-                        if event.timestamp_ms <= snapshot_ms {
-                            continue;
-                        }
-                        let changes = apply_book_changes(&mut book, &event.changes)?;
-                        self.update_memory_changes(&token_id, changes, event.timestamp_ms)?;
-                    }
-
-                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id) {
-                        state.book = BookState::Live(book);
-                    }
-                }
-            }
-            Err(message) => {
-                let retry_at = now_ms() + REST_SEED_RETRY.as_millis() as i64;
-                warn!(error = %message, tokens = token_ids.len(), "REST seed failed");
-                for token_id in &token_ids {
-                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
-                        state.seed = if state.pressure.memory().is_some() {
-                            SeedState::Idle
-                        } else {
-                            SeedState::RetryAfter(retry_at)
-                        };
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     async fn consume_subscription_event(&mut self, event: SubscriptionEvent) -> Result<()> {
         match event {
             SubscriptionEvent::ContinuityLost { token_ids } => {
                 for token_id in &token_ids {
                     if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
-                        state.book = BookState::default();
+                        state.book = BookState::Unhydrated;
                     }
                 }
                 debug!(tokens = token_ids.len(), "subscription continuity lost");
@@ -829,19 +623,50 @@ impl AgeRecorder {
                         return Ok(());
                     }
 
+                    self.register_market_token(&event.market, &token_id)?;
+                    let excluded = HashSet::from([token_id.clone()]);
+                    let market_watermark = self.observe_market_watermark(
+                        &event.market,
+                        event.timestamp_ms,
+                        &excluded,
+                    )?;
+
+                    let was_live = matches!(
+                        self.tokens.get(&token_id),
+                        Some(TokenState::Watched(WatchedTokenState {
+                            book: BookState::Live(_),
+                            ..
+                        }))
+                    );
                     let book = AskBook::from_snapshot(&event.asks)?;
                     let levels = book.pressure_levels();
-                    let valid_through_ms = snapshot_requested_at_ms.max(event_timestamp_ms(
-                        event.timestamp.as_ref(),
-                        snapshot_requested_at_ms,
-                    ));
-                    self.update_memory_replace(&token_id, levels, valid_through_ms)?;
+
+                    if snapshot_requested_at_ms.is_some() || !was_live {
+                        let requested_at_ms = snapshot_requested_at_ms.ok_or_else(|| {
+                            anyhow!(
+                                "initial book for token {} has no subscription watermark",
+                                short_token(&token_id)
+                            )
+                        })?;
+                        let valid_through_ms =
+                            market_watermark.map_or(requested_at_ms, |value| value.max(requested_at_ms));
+                        self.update_memory_snapshot(&token_id, levels, valid_through_ms)?;
+                    } else {
+                        let valid_through_ms =
+                            self.token_event_watermark(&token_id, market_watermark)?;
+                        self.update_memory_continuous_replace(
+                            &token_id,
+                            levels,
+                            valid_through_ms,
+                        )?;
+                    }
+
                     if let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id) {
                         state.book = BookState::Live(book);
                     }
                 }
                 MarketEvent::PriceChange(event) => {
-                    let timestamp_ms = event_timestamp_ms(event.timestamp.as_ref(), now_ms());
+                    let market = event.market;
                     let mut by_token = BTreeMap::<String, Vec<RawPriceChange>>::new();
 
                     for change in event.price_changes {
@@ -850,6 +675,7 @@ impl AgeRecorder {
                             .get(&change.asset_id)
                             .is_some_and(TokenState::is_watched)
                         {
+                            self.register_market_token(&market, &change.asset_id)?;
                             by_token
                                 .entry(change.asset_id.clone())
                                 .or_default()
@@ -857,53 +683,74 @@ impl AgeRecorder {
                         }
                     }
 
+                    let changed_tokens = by_token.keys().cloned().collect::<HashSet<_>>();
+                    let market_watermark = self.observe_market_watermark(
+                        &market,
+                        event.timestamp_ms,
+                        &changed_tokens,
+                    )?;
+
                     for (token_id, changes) in by_token {
                         let pressure_changes = {
                             let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id)
                             else {
                                 continue;
                             };
-                            match &mut state.book {
-                                BookState::Live(book) => Some(apply_book_changes(book, &changes)?),
-                                BookState::Unhydrated { buffered } => {
-                                    buffered.push(BufferedPriceChangeEvent {
-                                        timestamp_ms,
-                                        changes,
-                                    });
-                                    None
-                                }
-                            }
+                            let BookState::Live(book) = &mut state.book else {
+                                // The later initial book is a complete ordered-stream
+                                // observation and supersedes any pre-snapshot deltas.
+                                continue;
+                            };
+                            apply_book_changes(book, &changes)?
                         };
 
-                        if let Some(pressure_changes) = pressure_changes {
-                            self.update_memory_changes(&token_id, pressure_changes, timestamp_ms)?;
+                        let valid_through_ms =
+                            self.token_event_watermark(&token_id, market_watermark)?;
+                        if pressure_changes.is_empty() {
+                            self.advance_memory(&token_id, valid_through_ms)?;
+                        } else {
+                            self.update_memory_changes(
+                                &token_id,
+                                pressure_changes,
+                                valid_through_ms,
+                            )?;
                         }
                     }
                 }
                 MarketEvent::MarketResolved(event) => {
+                    let market = event.market;
+                    let winner = event.winning_asset_id;
+                    let mut resolving = self
+                        .markets
+                        .get(&market)
+                        .map(|state| state.token_ids.clone())
+                        .unwrap_or_default();
+                    resolving.extend(event.assets_ids);
+                    resolving.insert(winner.clone());
+                    resolving.retain(|token_id| self.tokens.contains_key(token_id));
+
+                    for token_id in &resolving {
+                        self.register_market_token(&market, token_id)?;
+                    }
+
+                    let excluded = resolving.iter().cloned().collect::<HashSet<_>>();
+                    let market_watermark = self
+                        .observe_market_watermark(
+                            &market,
+                            Some(event.timestamp_ms),
+                            &excluded,
+                        )?
+                        .expect("resolution timestamp always produces a market watermark");
+
                     let mut removed = Vec::new();
-                    for token_id in event.assets_ids.unwrap_or_default() {
-                        if self.tokens.contains_key(&token_id) {
-                            self.ensure_memory(&token_id)?;
+                    for token_id in resolving {
+                        if self.complete_token(
+                            &token_id,
+                            token_id == winner,
+                            market_watermark,
+                        )? {
+                            removed.push(token_id);
                         }
-
-                        let next = match self.tokens.remove(&token_id) {
-                            Some(state) => {
-                                let (completed, was_watched) = state.complete();
-                                if was_watched {
-                                    removed.push(token_id.clone());
-                                }
-                                completed
-                            }
-                            None => TokenState::Completed(CompletedTokenState {
-                                recording_since_ms: None,
-                                pressure: PressureState::Missing,
-                                pending_pressure_mutations: Vec::new(),
-                            }),
-                        };
-
-                        self.tokens.insert(token_id.clone(), next);
-                        self.dirty.insert(token_id);
                     }
 
                     if !removed.is_empty() {
@@ -915,7 +762,128 @@ impl AgeRecorder {
         Ok(())
     }
 
-    fn update_memory_replace(
+    fn register_market_token(&mut self, market_id: &str, token_id: &str) -> Result<()> {
+        for (other_market_id, state) in &self.markets {
+            if other_market_id != market_id && state.token_ids.contains(token_id) {
+                return Err(anyhow!(
+                    "token {} moved from market {other_market_id} to {market_id}",
+                    short_token(token_id)
+                ));
+            }
+        }
+
+        self.markets
+            .entry(market_id.to_owned())
+            .or_default()
+            .token_ids
+            .insert(token_id.to_owned());
+        Ok(())
+    }
+
+    fn observe_market_watermark(
+        &mut self,
+        market_id: &str,
+        timestamp_ms: Option<i64>,
+        excluded_tokens: &HashSet<String>,
+    ) -> Result<Option<i64>> {
+        let watermark_ms = {
+            let market = self.markets.entry(market_id.to_owned()).or_default();
+            if let Some(timestamp_ms) = timestamp_ms {
+                market.watermark_ms = Some(
+                    market
+                        .watermark_ms
+                        .map_or(timestamp_ms, |previous| previous.max(timestamp_ms)),
+                );
+            }
+            market.watermark_ms
+        };
+
+        if let Some(watermark_ms) = watermark_ms {
+            self.advance_market_through(market_id, watermark_ms, excluded_tokens)?;
+        }
+        Ok(watermark_ms)
+    }
+
+    fn advance_market_through(
+        &mut self,
+        market_id: &str,
+        watermark_ms: i64,
+        excluded_tokens: &HashSet<String>,
+    ) -> Result<()> {
+        let token_ids = self
+            .markets
+            .get(market_id)
+            .map(|market| {
+                market
+                    .token_ids
+                    .iter()
+                    .filter(|token_id| !excluded_tokens.contains(*token_id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for token_id in token_ids {
+            let is_live = matches!(
+                self.tokens.get(&token_id),
+                Some(TokenState::Watched(WatchedTokenState {
+                    book: BookState::Live(_),
+                    ..
+                }))
+            );
+            if is_live {
+                self.advance_memory(&token_id, watermark_ms)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn token_event_watermark(
+        &mut self,
+        token_id: &str,
+        market_watermark_ms: Option<i64>,
+    ) -> Result<i64> {
+        self.ensure_memory(token_id)?;
+        let current = self
+            .tokens
+            .get(token_id)
+            .and_then(|state| state.pressure().memory())
+            .and_then(PressureFrontierMemory::valid_through_ms);
+
+        match (current, market_watermark_ms) {
+            (Some(current), Some(market)) => Ok(current.max(market)),
+            (Some(current), None) => Ok(current),
+            (None, Some(market)) => Ok(market),
+            (None, None) => Err(anyhow!(
+                "continuous event for token {} has no causal watermark",
+                short_token(token_id)
+            )),
+        }
+    }
+
+    fn advance_memory(&mut self, token_id: &str, valid_through_ms: i64) -> Result<()> {
+        self.ensure_memory(token_id)?;
+        let state = self
+            .tokens
+            .get_mut(token_id)
+            .ok_or_else(|| anyhow!("cannot advance unknown token {token_id}"))?;
+        let memory = state.pressure_mut().memory_or_default()?;
+        let valid_through_ms = memory
+            .valid_through_ms()
+            .map_or(valid_through_ms, |current| current.max(valid_through_ms));
+
+        if !memory.observe_through(valid_through_ms)? {
+            return Ok(());
+        }
+
+        state
+            .pending_pressure_mutations_mut()
+            .push(RecorderPressureMutation::Advance { valid_through_ms });
+        self.finish_memory_update(token_id, valid_through_ms);
+        Ok(())
+    }
+
+    fn update_memory_snapshot(
         &mut self,
         token_id: &str,
         levels: Vec<PressureLevel>,
@@ -927,6 +895,9 @@ impl AgeRecorder {
             .get_mut(token_id)
             .ok_or_else(|| anyhow!("cannot update unknown token {token_id}"))?;
         let memory = state.pressure_mut().memory_or_default()?;
+        let valid_through_ms = memory
+            .valid_through_ms()
+            .map_or(valid_through_ms, |current| current.max(valid_through_ms));
 
         if !memory.observe_levels(&levels, valid_through_ms)? {
             return Ok(());
@@ -935,6 +906,36 @@ impl AgeRecorder {
         state
             .pending_pressure_mutations_mut()
             .push(RecorderPressureMutation::Replace {
+                valid_through_ms,
+                levels,
+            });
+        self.finish_memory_update(token_id, valid_through_ms);
+        Ok(())
+    }
+
+    fn update_memory_continuous_replace(
+        &mut self,
+        token_id: &str,
+        levels: Vec<PressureLevel>,
+        valid_through_ms: i64,
+    ) -> Result<()> {
+        self.ensure_memory(token_id)?;
+        let state = self
+            .tokens
+            .get_mut(token_id)
+            .ok_or_else(|| anyhow!("cannot update unknown token {token_id}"))?;
+        let memory = state.pressure_mut().memory_or_default()?;
+        let valid_through_ms = memory
+            .valid_through_ms()
+            .map_or(valid_through_ms, |current| current.max(valid_through_ms));
+
+        if !memory.replace_continuous(&levels, valid_through_ms)? {
+            return Ok(());
+        }
+
+        state
+            .pending_pressure_mutations_mut()
+            .push(RecorderPressureMutation::ReplaceContinuous {
                 valid_through_ms,
                 levels,
             });
@@ -954,12 +955,11 @@ impl AgeRecorder {
             .get_mut(token_id)
             .ok_or_else(|| anyhow!("cannot update unknown token {token_id}"))?;
         let memory = state.pressure_mut().memory_or_default()?;
+        let valid_through_ms = memory
+            .valid_through_ms()
+            .map_or(valid_through_ms, |current| current.max(valid_through_ms));
 
-        let mut mutated = memory.update_levels(&changes, valid_through_ms)?;
-        if memory.observe_through(valid_through_ms)? {
-            mutated = true;
-        }
-        if !mutated {
+        if !memory.update_levels(&changes, valid_through_ms)? {
             return Ok(());
         }
 
@@ -971,6 +971,51 @@ impl AgeRecorder {
             });
         self.finish_memory_update(token_id, valid_through_ms);
         Ok(())
+    }
+
+    fn complete_token(
+        &mut self,
+        token_id: &str,
+        winner: bool,
+        resolved_at_ms: i64,
+    ) -> Result<bool> {
+        if !self.tokens.contains_key(token_id) {
+            return Ok(false);
+        }
+        self.ensure_memory(token_id)?;
+
+        let Some(state) = self.tokens.remove(token_id) else {
+            return Ok(false);
+        };
+        let TokenState::Watched(mut state) = state else {
+            self.tokens.insert(token_id.to_owned(), state);
+            return Ok(false);
+        };
+
+        let memory = state.pressure.memory_or_default()?;
+        let resolved_at_ms = memory
+            .valid_through_ms()
+            .map_or(resolved_at_ms, |current| current.max(resolved_at_ms));
+        if winner {
+            memory.resolve_winner(resolved_at_ms)?;
+        } else {
+            memory.resolve_loser(resolved_at_ms)?;
+        }
+
+        if state.recording_since_ms.is_none() {
+            state.recording_since_ms = Some(resolved_at_ms);
+        }
+
+        self.tokens.insert(
+            token_id.to_owned(),
+            TokenState::Completed(CompletedTokenState {
+                recording_since_ms: state.recording_since_ms,
+                pressure: state.pressure,
+                pending_pressure_mutations: state.pending_pressure_mutations,
+            }),
+        );
+        self.dirty.insert(token_id.to_owned());
+        Ok(true)
     }
 
     fn finish_memory_update(&mut self, token_id: &str, valid_through_ms: i64) {
@@ -1102,15 +1147,7 @@ fn dedupe(token_ids: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
-}
-
-fn short_token(token_id: &str) -> String {
+fn short_token(token_id: &str) -> String {fn short_token(token_id: &str) -> String {
     if token_id.len() <= 12 {
         token_id.to_owned()
     } else {
@@ -1123,41 +1160,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completing_token_moves_transient_watched_state_into_completed_state() {
-        let mut memory = PressureFrontierMemory::default();
-        memory
-            .observe_levels(
-                &[PressureLevel {
-                    price: 6_000,
-                    shares: 12.0,
-                }],
-                1_000,
-            )
-            .unwrap();
-
-        let state = TokenState::Watched(WatchedTokenState {
-            recording_since_ms: Some(1_000),
-            pressure: PressureState::Loaded(memory),
-            book: BookState::default(),
-            pending_pressure_mutations: Vec::new(),
-            seed: SeedState::InFlight,
-        });
-
-        let (state, was_watched) = state.complete();
-        assert!(was_watched);
-
-        let TokenState::Completed(state) = state else {
-            panic!("completed token must not retain watched-only state");
-        };
-        assert_eq!(state.recording_since_ms, Some(1_000));
-        assert!(state.pressure.memory().unwrap().current_levels().is_empty());
-        assert_eq!(
-            state.pending_pressure_mutations,
-            vec![RecorderPressureMutation::Clear]
-        );
-    }
-
-    #[test]
+    fn book_changes_keep_only_ask_pressure() {    #[test]
     fn book_changes_keep_only_ask_pressure() {
         let mut book = AskBook::default();
         let changes = vec![
