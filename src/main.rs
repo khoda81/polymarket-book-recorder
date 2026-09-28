@@ -2,7 +2,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
-use polymarket_book_recorder::{api, recorder, store::RecorderStore};
+use polymarket_book_recorder::{
+    api,
+    fees::FeeResolver,
+    migration_v7,
+    recorder,
+    store::RecorderStore,
+};
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -41,9 +47,15 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let store = Arc::new(RecorderStore::open(&args.database)?);
+    let mut fees = FeeResolver::new();
+    migration_v7::migrate_database_v7_to_v8(&args.database, &mut fees).await?;
 
-    let runtime = recorder::start(store).await?;
+    let store = Arc::new(RecorderStore::open(&args.database)?);
+    for market in store.load_market_fees()? {
+        fees.seed(market);
+    }
+
+    let runtime = recorder::start(store, fees).await?;
     let app = api::router(runtime.handle());
     let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
 
