@@ -415,11 +415,6 @@ fn initialize_database(connection: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
-    if version == 6 {
-        crate::migration_v6::migrate_database_v6_to_v7(connection)?;
-        return Ok(());
-    }
-
     if version == 0 {
         let existing_tables = connection.query_row(
             r#"
