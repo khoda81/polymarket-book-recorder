@@ -84,6 +84,42 @@ impl Default for PressureFrontierMemory {
     }
 }
 
+impl PressureFrontierSnapshot {
+    pub(crate) fn to_proto(&self) -> crate::proto::PressureFrontierSnapshot {
+        use crate::proto::pressure_frontier_snapshot::State;
+
+        let state = match &self.state {
+            SnapshotState::Unobserved => State::Unobserved(crate::proto::Unobserved {}),
+            SnapshotState::Observed {
+                valid_through_ms,
+                runs,
+            } => State::Observed(crate::proto::Observed {
+                valid_through_ms: Some(*valid_through_ms),
+                runs: runs
+                    .iter()
+                    .map(|run| crate::proto::PressureRun {
+                        price: u32::from(run.price),
+                        shares: run.shares,
+                        frozen_steps: run
+                            .frozen_steps
+                            .iter()
+                            .map(|step| crate::proto::FrozenStep {
+                                hi_volume: step.hi_volume,
+                                valid_through_ms: Some(step.valid_through_ms),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            }),
+            SnapshotState::ResolvedUnbounded => {
+                State::ResolvedUnbounded(crate::proto::ResolvedUnbounded {})
+            }
+        };
+
+        crate::proto::PressureFrontierSnapshot { state: Some(state) }
+    }
+}
+
 impl PressureFrontierMemory {
     pub fn restore(snapshot: PressureFrontierSnapshot) -> Result<Self> {
         ensure!(
