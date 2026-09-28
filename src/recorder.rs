@@ -1274,8 +1274,7 @@ mod tests {
         let fee = FeeSchedule::new("0.04".parse().unwrap(), 1).unwrap();
         let pair = (1..crate::pressure::PRICE_SCALE)
             .find(|&raw| {
-                fee.effective_ask_tick(raw).unwrap()
-                    == fee.effective_ask_tick(raw + 1).unwrap()
+                fee.effective_ask_tick(raw).unwrap() == fee.effective_ask_tick(raw + 1).unwrap()
             })
             .unwrap();
         let price_a = format!("{:.4}", f64::from(pair) / 10_000.0);

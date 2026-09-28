@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    io::Read,
-    path::Path,
-};
+use std::{collections::HashMap, io::Read, path::Path};
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
@@ -76,9 +72,7 @@ pub async fn migrate_database_v7_to_v8(
                     memory
                         .map_prices(|price| market.schedule.effective_ask_tick(price))
                         .with_context(|| {
-                            format!(
-                                "mapping token {token_id} into effective taker-price space"
-                            )
+                            format!("mapping token {token_id} into effective taker-price space")
                         })?;
                 }
                 8 => {}
@@ -179,9 +173,7 @@ fn seed_persisted_fees(connection: &Connection, fees: &mut FeeResolver) -> Resul
         for row in rows {
             let (token_id, condition_id) = row?;
             let (_, token_ids) = markets.get_mut(&condition_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "token {token_id} references missing fee market {condition_id}"
-                )
+                anyhow::anyhow!("token {token_id} references missing fee market {condition_id}")
             })?;
             token_ids.push(token_id);
         }
@@ -263,16 +255,17 @@ fn load_pressure_for_migration(
 
     let (mut memory, semantic_version) = match checkpoint {
         Some(checkpoint) => decode_migration_checkpoint(&checkpoint)?,
-        None => (PressureFrontierMemory::default(), LEGACY_DATABASE_VERSION as u8),
+        None => (
+            PressureFrontierMemory::default(),
+            LEGACY_DATABASE_VERSION as u8,
+        ),
     };
 
     for (seq, payload) in mutations {
-        let mutation = decode_pressure_mutation(&payload).with_context(|| {
-            format!("decoding pressure mutation seq={seq} token={token_id}")
-        })?;
-        replay_pressure_mutation(&mut memory, mutation).with_context(|| {
-            format!("replaying pressure mutation seq={seq} token={token_id}")
-        })?;
+        let mutation = decode_pressure_mutation(&payload)
+            .with_context(|| format!("decoding pressure mutation seq={seq} token={token_id}"))?;
+        replay_pressure_mutation(&mut memory, mutation)
+            .with_context(|| format!("replaying pressure mutation seq={seq} token={token_id}"))?;
     }
 
     Ok(Some((memory, semantic_version)))
@@ -302,10 +295,7 @@ fn decode_migration_checkpoint(value: &[u8]) -> Result<(PressureFrontierMemory, 
     value["version"] = Value::from(SNAPSHOT_VERSION);
     let snapshot: PressureFrontierSnapshot =
         serde_json::from_value(value).context("normalizing pressure checkpoint to v8")?;
-    Ok((
-        PressureFrontierMemory::restore(snapshot)?,
-        semantic_version,
-    ))
+    Ok((PressureFrontierMemory::restore(snapshot)?, semantic_version))
 }
 
 #[cfg(test)]

@@ -3,11 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Result;
 use clap::Parser;
 use polymarket_book_recorder::{
-    api,
-    fees::FeeResolver,
-    migration_v7,
-    recorder,
-    store::RecorderStore,
+    api, fees::FeeResolver, migration_v7, recorder, store::RecorderStore,
 };
 use tokio::net::TcpListener;
 use tracing::info;

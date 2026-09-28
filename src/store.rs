@@ -241,8 +241,8 @@ impl RecorderStore {
             })?;
             for row in rows {
                 let (condition_id, rate, exponent) = row?;
-                let exponent = u32::try_from(exponent)
-                    .context("persisted fee exponent does not fit u32")?;
+                let exponent =
+                    u32::try_from(exponent).context("persisted fee exponent does not fit u32")?;
                 markets.insert(
                     condition_id,
                     (FeeSchedule::from_persisted(&rate, exponent)?, Vec::new()),
@@ -260,9 +260,7 @@ impl RecorderStore {
             for row in rows {
                 let (token_id, condition_id) = row?;
                 let (_, token_ids) = markets.get_mut(&condition_id).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "token {token_id} references missing fee market {condition_id}"
-                    )
+                    anyhow::anyhow!("token {token_id} references missing fee market {condition_id}")
                 })?;
                 token_ids.push(token_id);
             }

@@ -1,14 +1,8 @@
-use std::{
-    collections::HashMap,
-    str::FromStr,
-};
+use std::{collections::HashMap, str::FromStr};
 
 use anyhow::{Context, Result, ensure};
 use reqwest::Client;
-use rust_decimal::{
-    Decimal,
-    prelude::ToPrimitive,
-};
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
 use serde_json::Number;
 
@@ -42,7 +36,8 @@ impl FeeSchedule {
 
     pub fn from_persisted(rate: &str, exponent: u32) -> Result<Self> {
         Self::new(
-            Decimal::from_str(rate).with_context(|| format!("invalid persisted fee rate: {rate}"))?,
+            Decimal::from_str(rate)
+                .with_context(|| format!("invalid persisted fee rate: {rate}"))?,
             exponent,
         )
     }
@@ -72,9 +67,7 @@ impl FeeSchedule {
         let base = price * (Decimal::ONE - price);
         let mut curve = Decimal::ONE;
         for _ in 0..self.exponent {
-            curve = curve
-                .checked_mul(base)
-                .context("fee curve overflow")?;
+            curve = curve.checked_mul(base).context("fee curve overflow")?;
         }
 
         let fee_per_share = self
@@ -181,13 +174,12 @@ impl FeeResolver {
         if let Some(market) = self.cached_for_market(condition_id) {
             return Ok(market.clone());
         }
-        self.refresh_market(condition_id).await.map(|(market, _)| market)
+        self.refresh_market(condition_id)
+            .await
+            .map(|(market, _)| market)
     }
 
-    pub async fn refresh_market(
-        &mut self,
-        condition_id: &str,
-    ) -> Result<(MarketFeeInfo, bool)> {
+    pub async fn refresh_market(&mut self, condition_id: &str) -> Result<(MarketFeeInfo, bool)> {
         let response = self
             .client
             .get(format!("{}/clob-markets/{condition_id}", self.base_url))
@@ -210,7 +202,11 @@ impl FeeResolver {
         let market = MarketFeeInfo {
             condition_id: condition_id.to_owned(),
             schedule,
-            token_ids: response.tokens.into_iter().map(|token| token.token_id).collect(),
+            token_ids: response
+                .tokens
+                .into_iter()
+                .map(|token| token.token_id)
+                .collect(),
         };
         let changed = self
             .by_market
@@ -303,7 +299,13 @@ mod tests {
 
     #[test]
     fn real_fee_schedules_are_monotone() {
-        for (rate, exponent) in [("0.03", 1), ("0.04", 1), ("0.05", 1), ("0.072", 1), ("0.25", 2)] {
+        for (rate, exponent) in [
+            ("0.03", 1),
+            ("0.04", 1),
+            ("0.05", 1),
+            ("0.072", 1),
+            ("0.25", 2),
+        ] {
             FeeSchedule::new(Decimal::from_str(rate).unwrap(), exponent)
                 .unwrap()
                 .validate_monotone()
