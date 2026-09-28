@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use serde::de;
 use serde::Deserialize;
+use serde::de;
 use serde_json::Value;
 
 use crate::book::RawBookLevel;
@@ -118,18 +118,15 @@ fn parse_market_event(value: Value) -> Result<Option<MarketEvent>> {
     };
 
     let event = match event_type {
-        "book" => MarketEvent::Book(
-            serde_json::from_value(value).context("decoding book market event")?,
-        ),
+        "book" => {
+            MarketEvent::Book(serde_json::from_value(value).context("decoding book market event")?)
+        }
         "price_change" => MarketEvent::PriceChange(
             serde_json::from_value(value).context("decoding price-change market event")?,
         ),
-        "last_trade_price" | "tick_size_change" | "best_bid_ask" => {
-            MarketEvent::Watermark(
-                serde_json::from_value(value)
-                    .context("decoding market watermark event")?,
-            )
-        }
+        "last_trade_price" | "tick_size_change" | "best_bid_ask" => MarketEvent::Watermark(
+            serde_json::from_value(value).context("decoding market watermark event")?,
+        ),
         "market_resolved" => MarketEvent::MarketResolved(
             serde_json::from_value(value).context("decoding market-resolved event")?,
         ),
@@ -138,7 +135,9 @@ fn parse_market_event(value: Value) -> Result<Option<MarketEvent>> {
     Ok(Some(event))
 }
 
-fn deserialize_optional_epoch_ms<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+fn deserialize_optional_epoch_ms<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<i64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -213,8 +212,7 @@ mod tests {
           "winning_asset_id":"yes",
           "timestamp":"1234"
         }"#;
-        let [MarketEvent::MarketResolved(event)] =
-            parse_market_message(valid).unwrap().as_slice()
+        let [MarketEvent::MarketResolved(event)] = parse_market_message(valid).unwrap().as_slice()
         else {
             panic!("expected resolution");
         };

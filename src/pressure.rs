@@ -139,11 +139,9 @@ impl PressureFrontierMemory {
                 valid_through_ms: *valid_through_ms,
                 runs: runs.clone(),
             },
-            MemoryState::ResolvedUnbounded { resolved_at_ms } => {
-                SnapshotState::ResolvedUnbounded {
-                    resolved_at_ms: *resolved_at_ms,
-                }
-            }
+            MemoryState::ResolvedUnbounded { resolved_at_ms } => SnapshotState::ResolvedUnbounded {
+                resolved_at_ms: *resolved_at_ms,
+            },
         };
         PressureFrontierSnapshot {
             version: SNAPSHOT_VERSION,
