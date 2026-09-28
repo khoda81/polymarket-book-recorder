@@ -9,7 +9,9 @@ use rusqlite::{Connection, params};
 use serde_json::Value;
 use tracing::info;
 
-use crate::pressure::{PRICE_SCALE, PressureFrontierMemory, PressureFrontierSnapshot, PressureLevel};
+use crate::pressure::{
+    PRICE_SCALE, PressureFrontierMemory, PressureFrontierSnapshot, PressureLevel,
+};
 
 const MUTATION_CLEAR: u8 = 0;
 const MUTATION_REPLACE: u8 = 1;
@@ -163,7 +165,9 @@ fn encode_v7_checkpoint(snapshot: &PressureFrontierSnapshot) -> Result<Vec<u8>> 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     serde_json::to_writer(&mut encoder, snapshot).context("serializing v7 pressure checkpoint")?;
     encoder.flush().context("flushing v7 pressure checkpoint")?;
-    encoder.finish().context("compressing v7 pressure checkpoint")
+    encoder
+        .finish()
+        .context("compressing v7 pressure checkpoint")
 }
 
 fn decode_legacy_mutation(value: &[u8]) -> Result<LegacyMutation> {
@@ -219,10 +223,7 @@ fn decode_legacy_mutation(value: &[u8]) -> Result<LegacyMutation> {
     for _ in 0..count {
         let price = u16::from_le_bytes(value[offset..offset + 2].try_into()?);
         let shares = f64::from_le_bytes(value[offset + 2..offset + 10].try_into()?);
-        ensure!(
-            price <= PRICE_SCALE,
-            "legacy pressure price exceeds scale"
-        );
+        ensure!(price <= PRICE_SCALE, "legacy pressure price exceeds scale");
         ensure!(
             shares.is_finite()
                 && shares >= 0.0
