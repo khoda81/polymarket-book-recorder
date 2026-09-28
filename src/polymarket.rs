@@ -212,8 +212,8 @@ mod tests {
           "winning_asset_id":"yes",
           "timestamp":"1234"
         }"#;
-        let [MarketEvent::MarketResolved(event)] = parse_market_message(valid).unwrap().as_slice()
-        else {
+        let events = parse_market_message(valid).unwrap();
+        let [MarketEvent::MarketResolved(event)] = events.as_slice() else {
             panic!("expected resolution");
         };
         assert_eq!(event.winning_asset_id.as_deref(), Some("yes"));
@@ -225,9 +225,8 @@ mod tests {
           "assets_ids":["yes","no"],
           "winning_asset_id":"yes"
         }"#;
-        let [MarketEvent::MarketResolved(event)] =
-            parse_market_message(missing_timestamp).unwrap().as_slice()
-        else {
+        let events = parse_market_message(missing_timestamp).unwrap();
+        let [MarketEvent::MarketResolved(event)] = events.as_slice() else {
             panic!("expected resolution");
         };
         assert_eq!(event.timestamp_ms, None);
