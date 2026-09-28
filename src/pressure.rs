@@ -143,7 +143,7 @@ impl PressureFrontierMemory {
         }
     }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear_legacy(&mut self) {
         self.state = MemoryState::Unobserved;
     }
 
