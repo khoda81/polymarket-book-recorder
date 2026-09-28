@@ -224,6 +224,48 @@ impl PressureFrontierMemory {
         Ok(true)
     }
 
+    /// Replay the old v6 mutation semantics exactly. Legacy deltas did not
+    /// prove continuity up to their own timestamp: disappearing pressure froze
+    /// at the previously known watermark, then the surviving frontier advanced.
+    pub(crate) fn replay_legacy_v6_update(
+        &mut self,
+        changes: &[PressureLevel],
+        valid_through_ms: i64,
+    ) -> Result<bool> {
+        self.ensure_mutable()?;
+        let valid_through_ms = self.require_monotonic_time(valid_through_ms)?;
+
+        let previous = self.current_levels_map();
+        let mut changed = BTreeMap::<u16, f64>::new();
+        for change in changes {
+            if change.price == 0
+                || change.price > PRICE_SCALE
+                || !change.shares.is_finite()
+                || change.shares < 0.0
+            {
+                continue;
+            }
+
+            let old_shares = previous.get(&change.price).copied().unwrap_or(0.0);
+            if !same_volume(change.shares, old_shares) {
+                changed.insert(change.price, change.shares);
+            }
+        }
+
+        let previous_time = self.valid_through_ms();
+        if changed.is_empty() {
+            return self.observe_through(valid_through_ms);
+        }
+
+        let mut runs = self.take_runs();
+        apply_level_changes(&mut runs, &changed, previous_time)?;
+        self.state = MemoryState::Observed {
+            valid_through_ms,
+            runs,
+        };
+        Ok(true)
+    }
+
     /// Replace the complete frontier on a continuous ordered stream.
     pub fn replace_continuous(
         &mut self,

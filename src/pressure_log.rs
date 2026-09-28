@@ -4,9 +4,10 @@ use crate::pressure::{PRICE_SCALE, PressureFrontierMemory, PressureLevel};
 
 const MUTATION_CLEAR: u8 = 0;
 const MUTATION_REPLACE: u8 = 1;
-const MUTATION_UPDATE: u8 = 2;
+const MUTATION_UPDATE_V6: u8 = 2;
 const MUTATION_ADVANCE: u8 = 3;
 const MUTATION_REPLACE_CONTINUOUS: u8 = 4;
+const MUTATION_UPDATE_CONTINUOUS: u8 = 5;
 const MUTATION_HEADER_BYTES: usize = 11;
 const MUTATION_LEVEL_BYTES: usize = 10;
 
@@ -19,6 +20,11 @@ pub enum RecorderPressureMutation {
     },
     /// Ordered-stream absolute level changes.
     Update {
+        valid_through_ms: i64,
+        changes: Vec<PressureLevel>,
+    },
+    /// Persisted v6 update semantics. Decode/replay only; never emit anew.
+    LegacyV6Update {
         valid_through_ms: i64,
         changes: Vec<PressureLevel>,
     },
@@ -63,13 +69,16 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
             valid_through_ms,
             changes,
         } => (
-            MUTATION_UPDATE,
+            MUTATION_UPDATE_CONTINUOUS,
             *valid_through_ms,
             changes
                 .iter()
                 .map(|change| (change.price, change.shares))
                 .collect(),
         ),
+        RecorderPressureMutation::LegacyV6Update { .. } => {
+            bail!("legacy v6 pressure updates are replay-only")
+        }
         RecorderPressureMutation::ReplaceContinuous {
             valid_through_ms,
             levels,
@@ -132,6 +141,12 @@ pub fn replay_pressure_mutation(
         } => {
             memory.update_levels(&changes, valid_through_ms)?;
         }
+        RecorderPressureMutation::LegacyV6Update {
+            valid_through_ms,
+            changes,
+        } => {
+            memory.replay_legacy_v6_update(&changes, valid_through_ms)?;
+        }
         RecorderPressureMutation::Advance { valid_through_ms } => {
             memory.observe_through(valid_through_ms)?;
         }
@@ -156,7 +171,8 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
 
     ensure!(
         kind == MUTATION_REPLACE
-            || kind == MUTATION_UPDATE
+            || kind == MUTATION_UPDATE_V6
+            || kind == MUTATION_UPDATE_CONTINUOUS
             || kind == MUTATION_ADVANCE
             || kind == MUTATION_REPLACE_CONTINUOUS,
         "unsupported pressure mutation kind: {kind}"
@@ -217,7 +233,11 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
             valid_through_ms,
             levels,
         },
-        MUTATION_UPDATE => RecorderPressureMutation::Update {
+        MUTATION_UPDATE_V6 => RecorderPressureMutation::LegacyV6Update {
+            valid_through_ms,
+            changes: levels,
+        },
+        MUTATION_UPDATE_CONTINUOUS => RecorderPressureMutation::Update {
             valid_through_ms,
             changes: levels,
         },
@@ -247,6 +267,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v6_update_replays_old_watermark_semantics() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
+                }],
+                1_000,
+            )
+            .unwrap();
+
+        let mut encoded = Vec::new();
+        encoded.push(MUTATION_UPDATE_V6);
+        encoded.extend_from_slice(&2_000_i64.to_le_bytes());
+        encoded.extend_from_slice(&1_u16.to_le_bytes());
+        encoded.extend_from_slice(&5_000_u16.to_le_bytes());
+        encoded.extend_from_slice(&4.0_f64.to_le_bytes());
+
+        let mutation = decode_pressure_mutation(&encoded).unwrap();
+        assert!(matches!(
+            mutation,
+            RecorderPressureMutation::LegacyV6Update { .. }
+        ));
+        replay_pressure_mutation(&mut memory, mutation).unwrap();
+
+        let snapshot = serde_json::to_value(memory.snapshot()).unwrap();
+        assert_eq!(
+            snapshot["state"]["runs"][0]["frozenSteps"][0]["validThroughMs"],
+            1_000
+        );
+    }
+
+    #[test]
     fn advance_and_continuous_replace_round_trip() {
         for mutation in [
             RecorderPressureMutation::Advance {
@@ -266,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_mutation_uses_integer_timestamp() {
+    fn continuous_update_uses_new_mutation_kind_and_integer_timestamp() {
         let mutation = RecorderPressureMutation::Update {
             valid_through_ms: 1_234,
             changes: vec![
@@ -282,7 +336,7 @@ mod tests {
         };
 
         let encoded = encode_pressure_mutation(&mutation).unwrap();
-        assert_eq!(encoded[0], MUTATION_UPDATE);
+        assert_eq!(encoded[0], MUTATION_UPDATE_CONTINUOUS);
         assert_eq!(&encoded[1..9], &1_234_i64.to_le_bytes());
         assert_eq!(&encoded[9..11], &2_u16.to_le_bytes());
         assert_eq!(&encoded[11..13], &125_u16.to_le_bytes());
