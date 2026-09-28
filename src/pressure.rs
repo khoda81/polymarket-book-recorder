@@ -257,8 +257,9 @@ impl PressureFrontierMemory {
 
         if let MemoryState::ResolvedUnbounded {
             resolved_at_ms: previous,
-        } = self.state
+        } = &self.state
         {
+            let previous = *previous;
             let next = match (previous, resolved_at_ms) {
                 (Some(previous), Some(next)) => Some(previous.max(next)),
                 (Some(previous), None) => Some(previous),
