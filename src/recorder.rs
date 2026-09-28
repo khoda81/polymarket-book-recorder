@@ -1192,13 +1192,16 @@ fn apply_book_changes(
     book: &mut AskBook,
     changes: &[RawPriceChange],
 ) -> Result<Vec<PressureLevel>> {
-    let mut pressure_changes = Vec::new();
+    let mut pressure_changes = BTreeMap::new();
     for change in changes {
         if let Some(change) = book.apply_change(&change.side, &change.price, &change.size)? {
-            pressure_changes.push(change);
+            pressure_changes.insert(change.price, change.shares);
         }
     }
-    Ok(pressure_changes)
+    Ok(pressure_changes
+        .into_iter()
+        .map(|(price, shares)| PressureLevel { price, shares })
+        .collect())
 }
 
 fn dedupe(token_ids: Vec<String>) -> Vec<String> {
