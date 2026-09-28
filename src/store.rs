@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+
 use crate::{
     pressure::{PressureFrontierMemory, PressureFrontierSnapshot},
     pressure_log::{
@@ -559,5 +560,24 @@ mod tests {
         let restored = store.load_pressure("token").unwrap().unwrap();
         assert_eq!(PressureFrontierMemory::restore(restored).unwrap(), memory);
         assert_eq!(store.stats().unwrap().pressure_log_mutations, 0);
+    }
+
+    #[test]
+    fn rejects_v5_database() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("recorder.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        drop(connection);
+
+        let error = match RecorderStore::open(&path) {
+            Ok(_) => panic!("v5 database should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Recorder database version 5 is unsupported; expected 6")
+        );
     }
 }

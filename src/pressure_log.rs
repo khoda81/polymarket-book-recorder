@@ -204,6 +204,4 @@ mod tests {
 
         assert_eq!(decode_pressure_mutation(&encoded).unwrap(), mutation);
     }
-
-
 }
