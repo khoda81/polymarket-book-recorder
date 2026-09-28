@@ -33,6 +33,10 @@ enum SnapshotState {
         valid_through_ms: i64,
         runs: Vec<PressureRun>,
     },
+    ResolvedWinner {
+        #[serde(rename = "resolvedAtMs")]
+        resolved_at_ms: i64,
+    },
 }
 
 /// One explicit price boundary in the pressure surface.
@@ -66,6 +70,9 @@ enum MemoryState {
     Observed {
         valid_through_ms: i64,
         runs: Vec<PressureRun>,
+    },
+    ResolvedWinner {
+        resolved_at_ms: i64,
     },
 }
 
@@ -102,6 +109,13 @@ impl PressureFrontierMemory {
                     runs,
                 }
             }
+            SnapshotState::ResolvedWinner { resolved_at_ms } => {
+                ensure!(
+                    resolved_at_ms >= 0,
+                    "pressure winner resolution timestamp must be non-negative"
+                );
+                MemoryState::ResolvedWinner { resolved_at_ms }
+            }
         };
 
         Ok(Self { state })
@@ -117,6 +131,11 @@ impl PressureFrontierMemory {
                 valid_through_ms: *valid_through_ms,
                 runs: runs.clone(),
             },
+            MemoryState::ResolvedWinner { resolved_at_ms } => {
+                SnapshotState::ResolvedWinner {
+                    resolved_at_ms: *resolved_at_ms,
+                }
+            }
         };
         PressureFrontierSnapshot {
             version: SNAPSHOT_VERSION,
@@ -128,12 +147,15 @@ impl PressureFrontierMemory {
         self.state = MemoryState::Unobserved;
     }
 
+    /// Install a complete observation without claiming continuity from the
+    /// previous current frontier to this observation.
     pub fn observe_levels(
         &mut self,
         levels: &[PressureLevel],
         valid_through_ms: i64,
     ) -> Result<bool> {
-        let valid_through_ms = self.normalize_time(valid_through_ms)?;
+        self.ensure_mutable()?;
+        let valid_through_ms = self.require_monotonic_time(valid_through_ms)?;
         let previous_time = self.valid_through_ms();
         let previous = self.current_levels_map();
         let next = normalize_levels(levels);
@@ -150,12 +172,15 @@ impl PressureFrontierMemory {
         Ok(geometry_changed || previous_time != Some(valid_through_ms))
     }
 
+    /// Apply an ordered-stream delta. The previous frontier is proven valid
+    /// through the event watermark before the mutation takes effect.
     pub fn update_levels(
         &mut self,
         changes: &[PressureLevel],
         valid_through_ms: i64,
     ) -> Result<bool> {
-        let valid_through_ms = self.normalize_time(valid_through_ms)?;
+        self.ensure_mutable()?;
+        let valid_through_ms = self.require_monotonic_time(valid_through_ms)?;
 
         let previous = self.current_levels_map();
         let mut changed = BTreeMap::<u16, f64>::new();
@@ -178,12 +203,11 @@ impl PressureFrontierMemory {
         }
 
         if changed.is_empty() {
-            return Ok(false);
+            return self.observe_through(valid_through_ms);
         }
 
-        let previous_time = self.valid_through_ms();
         let mut runs = self.take_runs();
-        apply_level_changes(&mut runs, &changed, previous_time)?;
+        apply_level_changes(&mut runs, &changed, Some(valid_through_ms))?;
         self.state = MemoryState::Observed {
             valid_through_ms,
             runs,
@@ -192,8 +216,22 @@ impl PressureFrontierMemory {
         Ok(true)
     }
 
+    /// Replace the complete frontier on a continuous ordered stream.
+    pub fn replace_continuous(
+        &mut self,
+        levels: &[PressureLevel],
+        valid_through_ms: i64,
+    ) -> Result<bool> {
+        let advanced = self.observe_through(valid_through_ms)?;
+        let replaced = self.observe_levels(levels, valid_through_ms)?;
+        Ok(advanced || replaced)
+    }
+
     pub fn observe_through(&mut self, valid_through_ms: i64) -> Result<bool> {
-        let valid_through_ms = self.normalize_time(valid_through_ms)?;
+        if matches!(self.state, MemoryState::ResolvedWinner { .. }) {
+            return Ok(false);
+        }
+        let valid_through_ms = self.require_monotonic_time(valid_through_ms)?;
         let previous_time = self.valid_through_ms();
         let runs = self.take_runs();
         self.state = MemoryState::Observed {
@@ -201,6 +239,25 @@ impl PressureFrontierMemory {
             runs,
         };
         Ok(previous_time != Some(valid_through_ms))
+    }
+
+    /// Resolution to this token dominates every finite historical offer.
+    pub fn resolve_winner(&mut self, resolved_at_ms: i64) -> Result<bool> {
+        if matches!(self.state, MemoryState::ResolvedWinner { .. }) {
+            return Ok(false);
+        }
+        let resolved_at_ms = self.require_monotonic_time(resolved_at_ms)?;
+        self.state = MemoryState::ResolvedWinner { resolved_at_ms };
+        Ok(true)
+    }
+
+    /// Resolution away from this token removes only future/current liquidity.
+    /// Historical maxima stay frozen at the resolution watermark.
+    pub fn resolve_loser(&mut self, resolved_at_ms: i64) -> Result<bool> {
+        if matches!(self.state, MemoryState::ResolvedWinner { .. }) {
+            return Ok(false);
+        }
+        self.replace_continuous(&[], resolved_at_ms)
     }
 
     pub fn current_levels(&self) -> Vec<PressureLevel> {
@@ -212,7 +269,9 @@ impl PressureFrontierMemory {
 
     fn current_levels_map(&self) -> BTreeMap<u16, f64> {
         let runs = match &self.state {
-            MemoryState::Unobserved => return BTreeMap::new(),
+            MemoryState::Unobserved | MemoryState::ResolvedWinner { .. } => {
+                return BTreeMap::new();
+            }
             MemoryState::Observed { runs, .. } => runs,
         };
 
@@ -222,29 +281,49 @@ impl PressureFrontierMemory {
             .collect()
     }
 
-    fn valid_through_ms(&self) -> Option<i64> {
+    pub fn valid_through_ms(&self) -> Option<i64> {
         match &self.state {
             MemoryState::Unobserved => None,
             MemoryState::Observed {
                 valid_through_ms, ..
             } => Some(*valid_through_ms),
+            MemoryState::ResolvedWinner { resolved_at_ms } => Some(*resolved_at_ms),
         }
     }
 
-    fn normalize_time(&self, value: i64) -> Result<i64> {
+    pub fn is_resolved_winner(&self) -> bool {
+        matches!(self.state, MemoryState::ResolvedWinner { .. })
+    }
+
+    fn ensure_mutable(&self) -> Result<()> {
+        ensure!(
+            !matches!(self.state, MemoryState::ResolvedWinner { .. }),
+            "resolved winner pressure is terminal"
+        );
+        Ok(())
+    }
+
+    fn require_monotonic_time(&self, value: i64) -> Result<i64> {
         ensure!(
             value >= 0,
             "pressure frontier timestamp must be non-negative"
         );
-        Ok(self
-            .valid_through_ms()
-            .map_or(value, |last| value.max(last)))
+        if let Some(last) = self.valid_through_ms() {
+            ensure!(
+                value >= last,
+                "pressure frontier timestamp moved backward: {value} < {last}"
+            );
+        }
+        Ok(value)
     }
 
     fn take_runs(&mut self) -> Vec<PressureRun> {
         match std::mem::replace(&mut self.state, MemoryState::Unobserved) {
             MemoryState::Unobserved => Vec::new(),
             MemoryState::Observed { runs, .. } => runs,
+            MemoryState::ResolvedWinner { .. } => {
+                unreachable!("terminal pressure cannot expose mutable runs")
+            }
         }
     }
 }
