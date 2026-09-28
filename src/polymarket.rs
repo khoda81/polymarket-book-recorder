@@ -66,9 +66,13 @@ pub struct MarketResolvedEvent {
     pub market: String,
     #[serde(default)]
     pub assets_ids: Vec<String>,
-    pub winning_asset_id: String,
-    #[serde(rename = "timestamp", deserialize_with = "deserialize_epoch_ms")]
-    pub timestamp_ms: i64,
+    pub winning_asset_id: Option<String>,
+    #[serde(
+        default,
+        rename = "timestamp",
+        deserialize_with = "deserialize_optional_epoch_ms"
+    )]
+    pub timestamp_ms: Option<i64>,
 }
 
 impl MarketEvent {
@@ -86,7 +90,7 @@ impl MarketEvent {
             Self::Book(event) => event.timestamp_ms,
             Self::PriceChange(event) => event.timestamp_ms,
             Self::Watermark(event) => event.timestamp_ms,
-            Self::MarketResolved(event) => Some(event.timestamp_ms),
+            Self::MarketResolved(event) => event.timestamp_ms,
         }
     }
 }
@@ -222,8 +226,8 @@ mod tests {
         else {
             panic!("expected resolution");
         };
-        assert_eq!(event.winning_asset_id, "yes");
-        assert_eq!(event.timestamp_ms, 1_234);
+        assert_eq!(event.winning_asset_id.as_deref(), Some("yes"));
+        assert_eq!(event.timestamp_ms, Some(1_234));
 
         let missing_timestamp = r#"{
           "event_type":"market_resolved",
@@ -231,6 +235,11 @@ mod tests {
           "assets_ids":["yes","no"],
           "winning_asset_id":"yes"
         }"#;
-        assert!(parse_market_message(missing_timestamp).is_err());
+        let [MarketEvent::MarketResolved(event)] =
+            parse_market_message(missing_timestamp).unwrap().as_slice()
+        else {
+            panic!("expected resolution");
+        };
+        assert_eq!(event.timestamp_ms, None);
     }
 }
