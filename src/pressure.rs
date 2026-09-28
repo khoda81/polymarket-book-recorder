@@ -629,7 +629,7 @@ mod tests {
             runs[0].frozen_steps,
             vec![FrozenStep {
                 hi_volume: 10.0,
-                valid_through_ms: 1_000,
+                valid_through_ms: 2_000,
             }]
         );
 
@@ -704,6 +704,132 @@ mod tests {
             ]
         );
         assert_eq!(runs[0].shares, 6.0);
+    }
+
+    #[test]
+    fn discontinuous_snapshot_does_not_bridge_the_gap() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
+                }],
+                1_000,
+            )
+            .unwrap();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 4.0,
+                }],
+                5_000,
+            )
+            .unwrap();
+
+        let SnapshotState::Observed {
+            valid_through_ms,
+            runs,
+        } = memory.snapshot().state
+        else {
+            panic!("expected observed pressure");
+        };
+        assert_eq!(valid_through_ms, 5_000);
+        assert_eq!(
+            runs[0].frozen_steps,
+            vec![FrozenStep {
+                hi_volume: 10.0,
+                valid_through_ms: 1_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn watermarks_cannot_move_backward() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
+                }],
+                2_000,
+            )
+            .unwrap();
+
+        assert!(memory.observe_through(1_999).is_err());
+        assert!(
+            memory
+                .update_levels(
+                    &[PressureLevel {
+                        price: 5_000,
+                        shares: 4.0,
+                    }],
+                    1_999,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn winner_resolution_discards_dominated_history() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
+                }],
+                1_000,
+            )
+            .unwrap();
+        memory.resolve_winner(2_000).unwrap();
+
+        assert!(memory.is_resolved_winner());
+        assert!(memory.current_levels().is_empty());
+        assert_eq!(
+            memory.snapshot().state,
+            SnapshotState::ResolvedWinner {
+                resolved_at_ms: 2_000,
+            }
+        );
+        assert_eq!(
+            PressureFrontierMemory::restore(memory.snapshot()).unwrap(),
+            memory
+        );
+    }
+
+    #[test]
+    fn loser_resolution_freezes_current_liquidity_at_resolution() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
+                }],
+                1_000,
+            )
+            .unwrap();
+        memory.resolve_loser(2_000).unwrap();
+
+        let SnapshotState::Observed {
+            valid_through_ms,
+            runs,
+        } = memory.snapshot().state
+        else {
+            panic!("expected historical loser pressure");
+        };
+        assert_eq!(valid_through_ms, 2_000);
+        assert_eq!(runs[0].shares, 0.0);
+        assert_eq!(
+            runs[0].frozen_steps,
+            vec![FrozenStep {
+                hi_volume: 10.0,
+                valid_through_ms: 2_000,
+            }]
+        );
     }
 
     #[test]

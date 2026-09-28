@@ -11,7 +11,7 @@ use tokio::{
     task::JoinHandle,
     time::MissedTickBehavior,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
     book::AskBook,
