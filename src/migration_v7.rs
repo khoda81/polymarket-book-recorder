@@ -1,7 +1,13 @@
-use std::{collections::HashMap, io::Read, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    io::{IsTerminal, Read, Write},
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use tracing::info;
@@ -14,10 +20,12 @@ use crate::{
 };
 
 const LEGACY_DATABASE_VERSION: i64 = 7;
+pub const DEFAULT_MIGRATION_CONCURRENCY: usize = 16;
 
 pub async fn migrate_database_v7_to_v8(
     path: impl AsRef<Path>,
     fees: &mut FeeResolver,
+    concurrency: usize,
 ) -> Result<()> {
     let path = path.as_ref();
     if !path.exists() {
@@ -49,20 +57,24 @@ pub async fn migrate_database_v7_to_v8(
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
 
+    ensure!(
+        concurrency > 0,
+        "migration concurrency must be greater than zero"
+    );
     info!(
         tokens = token_ids.len(),
+        concurrency,
         "migrating recorder pressure prices from raw v7 to effective v8"
     );
 
-    for (index, token_id) in token_ids.iter().enumerate() {
-        let market = match fees.cached_for_token(token_id) {
-            Some(market) => market.clone(),
-            None => fees
-                .resolve_token(token_id)
-                .await
-                .with_context(|| format!("resolving fee schedule for token {token_id}"))?,
-        };
-        persist_market_fee(&mut connection, &market)?;
+    hydrate_fee_metadata(&mut connection, fees, &token_ids, concurrency).await?;
+
+    let mut progress = MigrationProgress::new("pressure rewrite", token_ids.len());
+    for token_id in &token_ids {
+        let market = fees
+            .cached_for_token(token_id)
+            .cloned()
+            .with_context(|| format!("fee metadata missing for token {token_id} after hydration"))?;
 
         if let Some((mut memory, semantic_version)) =
             load_pressure_for_migration(&connection, token_id)?
@@ -91,14 +103,9 @@ pub async fn migrate_database_v7_to_v8(
             transaction.commit()?;
         }
 
-        if (index + 1) % 100 == 0 || index + 1 == token_ids.len() {
-            info!(
-                migrated = index + 1,
-                total = token_ids.len(),
-                "effective-price migration progress"
-            );
-        }
+        progress.inc();
     }
+    progress.finish();
 
     connection.pragma_update(
         None,
@@ -106,6 +113,53 @@ pub async fn migrate_database_v7_to_v8(
         crate::store::RECORDER_DATABASE_VERSION,
     )?;
     info!("recorder effective-price migration to schema v8 complete");
+    Ok(())
+}
+
+async fn hydrate_fee_metadata(
+    connection: &mut Connection,
+    fees: &mut FeeResolver,
+    token_ids: &[String],
+    concurrency: usize,
+) -> Result<()> {
+    let lookup = fees.lookup();
+    let mut next_index = 0;
+    let mut in_flight = FuturesUnordered::new();
+    let mut persisted_markets = HashSet::new();
+    let mut progress = MigrationProgress::new("fee metadata", token_ids.len());
+
+    while next_index < token_ids.len() || !in_flight.is_empty() {
+        while in_flight.len() < concurrency && next_index < token_ids.len() {
+            let token_id = token_ids[next_index].clone();
+            next_index += 1;
+
+            if let Some(market) = fees.cached_for_token(&token_id) {
+                if persisted_markets.insert(market.condition_id.clone()) {
+                    persist_market_fee(connection, market)?;
+                }
+                progress.inc();
+                continue;
+            }
+
+            let lookup = lookup.clone();
+            in_flight.push(async move {
+                let result = lookup.resolve_token(&token_id).await;
+                (token_id, result)
+            });
+        }
+
+        if let Some((token_id, result)) = in_flight.next().await {
+            let market = result
+                .with_context(|| format!("resolving fee schedule for token {token_id}"))?;
+            if persisted_markets.insert(market.condition_id.clone()) {
+                persist_market_fee(connection, &market)?;
+            }
+            fees.seed(market);
+            progress.inc();
+        }
+    }
+
+    progress.finish();
     Ok(())
 }
 
@@ -298,6 +352,140 @@ fn decode_migration_checkpoint(value: &[u8]) -> Result<(PressureFrontierMemory, 
     Ok((PressureFrontierMemory::restore(snapshot)?, semantic_version))
 }
 
+
+struct MigrationProgress {
+    label: &'static str,
+    total: usize,
+    done: usize,
+    started: Instant,
+    last_draw: Instant,
+    interactive: bool,
+    finished: bool,
+}
+
+impl MigrationProgress {
+    const BAR_WIDTH: usize = 28;
+    const DRAW_INTERVAL: Duration = Duration::from_millis(200);
+
+    fn new(label: &'static str, total: usize) -> Self {
+        let now = Instant::now();
+        let mut progress = Self {
+            label,
+            total,
+            done: 0,
+            started: now,
+            last_draw: now,
+            interactive: std::io::stderr().is_terminal(),
+            finished: false,
+        };
+
+        if progress.interactive {
+            progress.draw();
+        } else {
+            info!(phase = label, total, "migration phase started");
+        }
+        progress
+    }
+
+    fn inc(&mut self) {
+        self.done += 1;
+        if self.interactive {
+            if self.done == self.total || self.last_draw.elapsed() >= Self::DRAW_INTERVAL {
+                self.draw();
+            }
+        } else if self.done % 100 == 0 || self.done == self.total {
+            let elapsed = self.started.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 {
+                self.done as f64 / elapsed
+            } else {
+                0.0
+            };
+            let eta = self.eta_text(rate);
+            info!(
+                phase = self.label,
+                completed = self.done,
+                total = self.total,
+                rate_per_second = rate,
+                eta = %eta,
+                "migration progress"
+            );
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.interactive {
+            self.draw();
+            let _ = writeln!(std::io::stderr().lock());
+        }
+        self.finished = true;
+    }
+
+    fn draw(&mut self) {
+        let filled = if self.total == 0 {
+            Self::BAR_WIDTH
+        } else {
+            self.done
+                .saturating_mul(Self::BAR_WIDTH)
+                .checked_div(self.total)
+                .unwrap_or(Self::BAR_WIDTH)
+                .min(Self::BAR_WIDTH)
+        };
+        let bar = format!(
+            "{}{}",
+            "#".repeat(filled),
+            "-".repeat(Self::BAR_WIDTH - filled)
+        );
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let rate = if elapsed > 0.0 {
+            self.done as f64 / elapsed
+        } else {
+            0.0
+        };
+        let eta = self.eta_text(rate);
+
+        let mut stderr = std::io::stderr().lock();
+        let _ = write!(
+            stderr,
+            "\r{:>16} [{}] {}/{} {:>6.1}/s ETA {:>8}",
+            self.label, bar, self.done, self.total, rate, eta
+        );
+        let _ = stderr.flush();
+        self.last_draw = Instant::now();
+    }
+
+    fn eta_text(&self, rate: f64) -> String {
+        if self.done >= self.total {
+            return "0s".to_owned();
+        }
+        if self.done == 0 || rate <= f64::EPSILON {
+            return "--".to_owned();
+        }
+
+        let seconds = (self.total - self.done) as f64 / rate;
+        format_duration(Duration::from_secs_f64(seconds))
+    }
+}
+
+impl Drop for MigrationProgress {
+    fn drop(&mut self) {
+        if self.interactive && !self.finished {
+            let _ = writeln!(std::io::stderr().lock());
+        }
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3_600 {
+        format!("{}h {:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -391,7 +579,9 @@ mod tests {
             token_ids: vec!["yes".into(), "no".into()],
         });
 
-        migrate_database_v7_to_v8(&path, &mut fees).await.unwrap();
+        migrate_database_v7_to_v8(&path, &mut fees, 4)
+            .await
+            .unwrap();
 
         let store = RecorderStore::open(&path).unwrap();
         let snapshot = store.load_pressure("yes").unwrap().unwrap();
