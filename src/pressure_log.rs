@@ -130,7 +130,7 @@ pub fn replay_pressure_mutation(
             valid_through_ms,
             levels,
         } => {
-            memory.observe_levels(&levels, valid_through_ms)?;
+            memory.replay_legacy_v6_replace(&levels, valid_through_ms)?;
         }
         RecorderPressureMutation::Update {
             valid_through_ms,
@@ -261,6 +261,48 @@ mod tests {
             RecorderPressureMutation::Clear
         );
         assert!(decode_pressure_mutation(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn legacy_v6_replay_max_aggregates_raw_timestamp_regressions() {
+        let mut memory = PressureFrontierMemory::default();
+        memory
+            .observe_levels(
+                &[PressureLevel {
+                    price: 5_000,
+                    shares: 10.0,
+                }],
+                1_001,
+            )
+            .unwrap();
+
+        replay_pressure_mutation(
+            &mut memory,
+            RecorderPressureMutation::LegacyV6Update {
+                valid_through_ms: 1_000,
+                changes: vec![PressureLevel {
+                    price: 5_000,
+                    shares: 4.0,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(memory.valid_through_ms(), Some(1_001));
+
+        replay_pressure_mutation(
+            &mut memory,
+            RecorderPressureMutation::Replace {
+                valid_through_ms: 999,
+                levels: vec![PressureLevel {
+                    price: 5_000,
+                    shares: 3.0,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(memory.valid_through_ms(), Some(1_001));
     }
 
     #[test]
