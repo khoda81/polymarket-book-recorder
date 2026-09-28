@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-pub const RECORDER_DATABASE_VERSION: i64 = 6;
+pub const RECORDER_DATABASE_VERSION: i64 = 7;
 pub const RECORDER_CHECKPOINT_MUTATIONS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -107,10 +107,10 @@ impl RecorderStore {
                 .with_context(|| format!("creating database directory {}", parent.display()))?;
         }
 
-        let connection = Connection::open(&path)
+        let mut connection = Connection::open(&path)
             .with_context(|| format!("opening recorder database {}", path.display()))?;
         configure_connection(&connection)?;
-        initialize_database(&connection)?;
+        initialize_database(&mut connection)?;
         let mutation_counts = load_mutation_counts(&connection)?;
 
         Ok(Self {
@@ -409,9 +409,14 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn initialize_database(connection: &Connection) -> Result<()> {
+fn initialize_database(connection: &mut Connection) -> Result<()> {
     let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     if version == RECORDER_DATABASE_VERSION {
+        return Ok(());
+    }
+
+    if version == 6 {
+        crate::migration_v6::migrate_database_v6_to_v7(connection)?;
         return Ok(());
     }
 
@@ -577,7 +582,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Recorder database version 5 is unsupported; expected 6")
+                .contains("Recorder database version 5 is unsupported; expected 7")
         );
     }
 }
