@@ -2,9 +2,11 @@
 
 Rust recorder backend for [Polymarket Viz](https://github.com/khoda81/polymarket-book-vis).
 
-The recorder persists canonical v7 pressure snapshots in the existing SQLite
-schema version 6. Persisted v6 pressure snapshots and mutation tails remain
-readable; older database schemas are rejected.
+The recorder persists canonical pressure state in SQLite schema version 7.
+Opening a schema-v6 database performs an eager, resumable migration: each
+legacy checkpoint + mutation tail is replayed with its original semantics,
+collapsed into one v7 checkpoint, and its old mutation rows are deleted before
+the database version is advanced to 7.
 
 ## Features
 
@@ -20,10 +22,10 @@ readable; older database schemas are rejected.
 - v7 pressure history as exact per-price current shares + frozen cumulative upper-edge steps
 - cumulative current pressure derived by prefix sum; lower historical edges are implicit
 - no duplicated current frontier and no persisted lower band edges
-- SQLite schema version 6
+- SQLite schema version 7
 - gzip-compressed pressure checkpoints
-- compact binary pressure mutation tails with integer millisecond timestamps
-- checkpoint + tail replay
+- protobuf pressure mutation tails with explicit oneof semantics and integer millisecond timestamps
+- gzip-compressed JSON checkpoints + protobuf tail replay
 - incremental writeback with a checkpoint every 512 mutations
 - `GET /api/recorder/health`
 - `GET /api/recorder/state`
