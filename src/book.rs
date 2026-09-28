@@ -84,12 +84,7 @@ impl AskBook {
         })
     }
 
-    pub fn apply_change(
-        &mut self,
-        side: &str,
-        price: &str,
-        size: &str,
-    ) -> Result<Option<u16>> {
+    pub fn apply_change(&mut self, side: &str, price: &str, size: &str) -> Result<Option<u16>> {
         match side {
             // Bids belong to the reverse token edge. They still matter as an
             // observation timestamp to PressureFrontierMemory, but there is no
@@ -178,10 +173,7 @@ mod tests {
         let mut book = AskBook::default();
         assert_eq!(book.apply_change("BUY", "0.5", "12").unwrap(), None);
 
-        assert_eq!(
-            book.apply_change("SELL", "0.5", "12").unwrap(),
-            Some(5_000)
-        );
+        assert_eq!(book.apply_change("SELL", "0.5", "12").unwrap(), Some(5_000));
         assert_eq!(
             book.pressure_levels(fee).unwrap(),
             vec![PressureLevel {
@@ -203,8 +195,7 @@ mod tests {
         // quantization; the projection must expose one aggregate level.
         let pair = (1..PRICE_SCALE)
             .find(|&raw| {
-                fee.effective_ask_tick(raw).unwrap()
-                    == fee.effective_ask_tick(raw + 1).unwrap()
+                fee.effective_ask_tick(raw).unwrap() == fee.effective_ask_tick(raw + 1).unwrap()
             })
             .expect("real fee curve should contain a quantization collision");
 
