@@ -179,10 +179,7 @@ fn decode_levels(
     Ok(levels)
 }
 
-fn validate_canonical_levels(
-    levels: &[PressureLevel],
-    allow_zero_shares: bool,
-) -> Result<()> {
+fn validate_canonical_levels(levels: &[PressureLevel], allow_zero_shares: bool) -> Result<()> {
     let mut previous_price = None;
     for level in levels {
         validate_level(level.price, level.shares, allow_zero_shares)?;
