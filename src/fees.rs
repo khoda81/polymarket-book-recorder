@@ -1,14 +1,18 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use reqwest::Client;
+use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Number;
 
 use crate::pressure::PRICE_SCALE;
 
 pub const DEFAULT_CLOB_REST_URL: &str = "https://clob.polymarket.com";
+
+const REQUEST_ATTEMPTS: usize = 6;
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
 
 /// Immutable taker-fee schedule attached to one CLOB market.
 ///
@@ -112,6 +116,115 @@ pub struct MarketFeeInfo {
     pub token_ids: Vec<String>,
 }
 
+#[derive(Clone)]
+pub struct FeeLookup {
+    client: Client,
+    base_url: String,
+}
+
+impl FeeLookup {
+    pub async fn resolve_token(&self, token_id: &str) -> Result<MarketFeeInfo> {
+        let response = self
+            .get_json::<MarketByTokenWire>(
+                &format!("/markets-by-token/{token_id}"),
+                "resolving Polymarket market by token",
+            )
+            .await?;
+        self.fetch_market(&response.condition_id).await
+    }
+
+    pub async fn fetch_market(&self, condition_id: &str) -> Result<MarketFeeInfo> {
+        let response = self
+            .get_json::<MarketInfoWire>(
+                &format!("/clob-markets/{condition_id}"),
+                "fetching Polymarket CLOB market info",
+            )
+            .await?;
+
+        let schedule = response
+            .fee
+            .map(FeeSchedule::try_from)
+            .transpose()?
+            .unwrap_or(FeeSchedule::ZERO);
+        schedule.validate_monotone()?;
+
+        Ok(MarketFeeInfo {
+            condition_id: condition_id.to_owned(),
+            schedule,
+            token_ids: response
+                .tokens
+                .into_iter()
+                .map(|token| token.token_id)
+                .collect(),
+        })
+    }
+
+    async fn get_json<T>(&self, path: &str, context: &'static str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let url = format!("{}{}", self.base_url, path);
+        let mut delay = INITIAL_RETRY_DELAY;
+
+        for attempt in 1..=REQUEST_ATTEMPTS {
+            match self.client.get(&url).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return response
+                            .json::<T>()
+                            .await
+                            .with_context(|| format!("decoding Polymarket response from {url}"));
+                    }
+
+                    if attempt < REQUEST_ATTEMPTS && is_retryable_status(status) {
+                        let retry_delay = retry_after(&response).unwrap_or(delay);
+                        tokio::time::sleep(retry_delay).await;
+                        delay = delay.saturating_mul(2).min(MAX_RETRY_DELAY);
+                        continue;
+                    }
+
+                    return Err(response
+                        .error_for_status()
+                        .expect_err("non-success status must fail"))
+                    .with_context(|| {
+                        format!("{context}: {url} failed on attempt {attempt}/{REQUEST_ATTEMPTS}")
+                    });
+                }
+                Err(error) => {
+                    if attempt == REQUEST_ATTEMPTS {
+                        return Err(error).with_context(|| {
+                            format!("{context}: {url} failed after {REQUEST_ATTEMPTS} attempts")
+                        });
+                    }
+
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(MAX_RETRY_DELAY);
+                }
+            }
+        }
+
+        unreachable!("retry loop always returns on its final attempt")
+    }
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 pub struct FeeResolver {
     client: Client,
     base_url: String,
@@ -150,64 +263,35 @@ impl FeeResolver {
         self.by_market.get(condition_id)
     }
 
+    pub fn lookup(&self) -> FeeLookup {
+        FeeLookup {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+        }
+    }
+
     pub async fn resolve_token(&mut self, token_id: &str) -> Result<MarketFeeInfo> {
         if let Some(market) = self.cached_for_token(token_id) {
             return Ok(market.clone());
         }
 
-        let response = self
-            .client
-            .get(format!("{}/markets-by-token/{token_id}", self.base_url))
-            .send()
-            .await
-            .context("resolving Polymarket market by token")?
-            .error_for_status()
-            .context("Polymarket markets-by-token request failed")?
-            .json::<MarketByTokenWire>()
-            .await
-            .context("decoding Polymarket markets-by-token response")?;
-
-        self.fetch_market(&response.condition_id).await
+        let market = self.lookup().resolve_token(token_id).await?;
+        self.seed(market.clone());
+        Ok(market)
     }
 
     pub async fn fetch_market(&mut self, condition_id: &str) -> Result<MarketFeeInfo> {
         if let Some(market) = self.cached_for_market(condition_id) {
             return Ok(market.clone());
         }
-        self.refresh_market(condition_id)
-            .await
-            .map(|(market, _)| market)
+
+        let market = self.lookup().fetch_market(condition_id).await?;
+        self.seed(market.clone());
+        Ok(market)
     }
 
     pub async fn refresh_market(&mut self, condition_id: &str) -> Result<(MarketFeeInfo, bool)> {
-        let response = self
-            .client
-            .get(format!("{}/clob-markets/{condition_id}", self.base_url))
-            .send()
-            .await
-            .context("fetching Polymarket CLOB market info")?
-            .error_for_status()
-            .context("Polymarket CLOB market-info request failed")?
-            .json::<MarketInfoWire>()
-            .await
-            .context("decoding Polymarket CLOB market info")?;
-
-        let schedule = response
-            .fee
-            .map(FeeSchedule::try_from)
-            .transpose()?
-            .unwrap_or(FeeSchedule::ZERO);
-        schedule.validate_monotone()?;
-
-        let market = MarketFeeInfo {
-            condition_id: condition_id.to_owned(),
-            schedule,
-            token_ids: response
-                .tokens
-                .into_iter()
-                .map(|token| token.token_id)
-                .collect(),
-        };
+        let market = self.lookup().fetch_market(condition_id).await?;
         let changed = self
             .by_market
             .get(condition_id)
@@ -311,5 +395,15 @@ mod tests {
                 .validate_monotone()
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
     }
 }
