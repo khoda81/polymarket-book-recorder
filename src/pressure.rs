@@ -13,7 +13,7 @@ pub struct PressureLevel {
     pub shares: f64,
 }
 
-/// Opaque v6 persisted pressure state.
+/// Opaque persisted pressure state (v7, with v6 restore compatibility).
 ///
 /// Current order-book levels live exactly once, as per-price shares in the
 /// runs. Cumulative current pressure is derived by prefix-summing those shares.
@@ -284,14 +284,12 @@ impl PressureFrontierMemory {
             return Ok(false);
         }
 
-        let watermark = match (self.valid_through_ms(), resolved_at_ms) {
-            (Some(current), Some(resolved)) => Some(current.max(resolved)),
-            (Some(current), None) => Some(current),
-            (None, Some(resolved)) => Some(resolved),
-            (None, None) => None,
-        };
+        if let Some(resolved_at_ms) = resolved_at_ms {
+            self.require_monotonic_time(resolved_at_ms)?;
+            return self.replace_continuous(&[], resolved_at_ms);
+        }
 
-        match watermark {
+        match self.valid_through_ms() {
             Some(watermark) => self.replace_continuous(&[], watermark),
             None => Ok(false),
         }
