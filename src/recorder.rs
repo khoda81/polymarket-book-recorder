@@ -367,7 +367,7 @@ struct AgeRecorder {
     store: Arc<RecorderStore>,
     subscriptions: SubscriptionPool,
     tokens: HashMap<String, TokenState>,
-    markets: HashMap<String, MarketState>,
+    markets: HashMap<(String, u64), MarketState>,
     dirty: BTreeSet<String>,
     command_rx: mpsc::Receiver<RecorderCommand>,
     subscription_rx: mpsc::Receiver<SubscriptionEvent>,
@@ -599,15 +599,24 @@ impl AgeRecorder {
 
     async fn consume_subscription_event(&mut self, event: SubscriptionEvent) -> Result<()> {
         match event {
-            SubscriptionEvent::ContinuityLost { token_ids } => {
+            SubscriptionEvent::ContinuityLost {
+                shard_id,
+                token_ids,
+            } => {
                 for token_id in &token_ids {
                     if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
                         state.book = BookState::Unhydrated;
                     }
                 }
-                debug!(tokens = token_ids.len(), "subscription continuity lost");
+                for ((_, market_shard_id), market) in &mut self.markets {
+                    if *market_shard_id == shard_id {
+                        market.watermark_ms = None;
+                    }
+                }
+                debug!(shard_id, tokens = token_ids.len(), "subscription continuity lost");
             }
             SubscriptionEvent::Market {
+                shard_id,
                 event,
                 snapshot_requested_at_ms,
             } => match event {
@@ -621,10 +630,11 @@ impl AgeRecorder {
                         return Ok(());
                     }
 
-                    self.register_market_token(&event.market, &token_id)?;
+                    self.register_market_token(&event.market, shard_id, &token_id)?;
                     let excluded = HashSet::from([token_id.clone()]);
                     let market_watermark = self.observe_market_watermark(
                         &event.market,
+                        shard_id,
                         event.timestamp_ms,
                         &excluded,
                     )?;
@@ -673,7 +683,7 @@ impl AgeRecorder {
                             .get(&change.asset_id)
                             .is_some_and(TokenState::is_watched)
                         {
-                            self.register_market_token(&market, &change.asset_id)?;
+                            self.register_market_token(&market, shard_id, &change.asset_id)?;
                             by_token
                                 .entry(change.asset_id.clone())
                                 .or_default()
@@ -684,6 +694,7 @@ impl AgeRecorder {
                     let changed_tokens = by_token.keys().cloned().collect::<HashSet<_>>();
                     let market_watermark = self.observe_market_watermark(
                         &market,
+                        shard_id,
                         event.timestamp_ms,
                         &changed_tokens,
                     )?;
@@ -720,21 +731,23 @@ impl AgeRecorder {
                     let winner = event.winning_asset_id;
                     let mut resolving = self
                         .markets
-                        .get(&market)
-                        .map(|state| state.token_ids.clone())
-                        .unwrap_or_default();
+                        .iter()
+                        .filter(|((market_id, _), _)| market_id == &market)
+                        .flat_map(|(_, state)| state.token_ids.iter().cloned())
+                        .collect::<BTreeSet<_>>();
                     resolving.extend(event.assets_ids);
                     resolving.insert(winner.clone());
                     resolving.retain(|token_id| self.tokens.contains_key(token_id));
 
                     for token_id in &resolving {
-                        self.register_market_token(&market, token_id)?;
+                        self.register_market_token(&market, shard_id, token_id)?;
                     }
 
                     let excluded = resolving.iter().cloned().collect::<HashSet<_>>();
                     let market_watermark = self
                         .observe_market_watermark(
                             &market,
+                            shard_id,
                             Some(event.timestamp_ms),
                             &excluded,
                         )?
@@ -760,18 +773,37 @@ impl AgeRecorder {
         Ok(())
     }
 
-    fn register_market_token(&mut self, market_id: &str, token_id: &str) -> Result<()> {
-        for (other_market_id, state) in &self.markets {
-            if other_market_id != market_id && state.token_ids.contains(token_id) {
+    fn register_market_token(
+        &mut self,
+        market_id: &str,
+        shard_id: u64,
+        token_id: &str,
+    ) -> Result<()> {
+        let current_key = (market_id.to_owned(), shard_id);
+        let previous_keys = self
+            .markets
+            .iter()
+            .filter(|(_, state)| state.token_ids.contains(token_id))
+            .map(|(key, _)| key.clone())
+            .filter(|key| key != &current_key)
+            .collect::<Vec<_>>();
+
+        for previous_key in previous_keys {
+            if previous_key.0 != market_id {
                 return Err(anyhow!(
-                    "token {} moved from market {other_market_id} to {market_id}",
-                    short_token(token_id)
+                    "token {} moved from market {} to {market_id}",
+                    short_token(token_id),
+                    previous_key.0
                 ));
             }
+            if let Some(previous) = self.markets.get_mut(&previous_key) {
+                previous.token_ids.remove(token_id);
+            }
         }
+        self.markets.retain(|_, state| !state.token_ids.is_empty());
 
         self.markets
-            .entry(market_id.to_owned())
+            .entry(current_key)
             .or_default()
             .token_ids
             .insert(token_id.to_owned());
@@ -781,23 +813,33 @@ impl AgeRecorder {
     fn observe_market_watermark(
         &mut self,
         market_id: &str,
+        shard_id: u64,
         timestamp_ms: Option<i64>,
         excluded_tokens: &HashSet<String>,
     ) -> Result<Option<i64>> {
+        let key = (market_id.to_owned(), shard_id);
         let watermark_ms = {
-            let market = self.markets.entry(market_id.to_owned()).or_default();
+            let market = self.markets.entry(key).or_default();
             if let Some(timestamp_ms) = timestamp_ms {
-                market.watermark_ms = Some(
-                    market
-                        .watermark_ms
-                        .map_or(timestamp_ms, |previous| previous.max(timestamp_ms)),
-                );
+                if let Some(previous) = market.watermark_ms {
+                    if timestamp_ms < previous {
+                        return Err(anyhow!(
+                            "market {market_id} timestamp regressed on shard {shard_id}: {timestamp_ms} < {previous}"
+                        ));
+                    }
+                }
+                market.watermark_ms = Some(timestamp_ms);
             }
             market.watermark_ms
         };
 
         if let Some(watermark_ms) = watermark_ms {
-            self.advance_market_through(market_id, watermark_ms, excluded_tokens)?;
+            self.advance_market_through(
+                market_id,
+                shard_id,
+                watermark_ms,
+                excluded_tokens,
+            )?;
         }
         Ok(watermark_ms)
     }
@@ -805,12 +847,13 @@ impl AgeRecorder {
     fn advance_market_through(
         &mut self,
         market_id: &str,
+        shard_id: u64,
         watermark_ms: i64,
         excluded_tokens: &HashSet<String>,
     ) -> Result<()> {
         let token_ids = self
             .markets
-            .get(market_id)
+            .get(&(market_id.to_owned(), shard_id))
             .map(|market| {
                 market
                     .token_ids
