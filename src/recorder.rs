@@ -726,6 +726,14 @@ impl AgeRecorder {
                         }
                     }
                 }
+                MarketEvent::Watermark(event) => {
+                    self.observe_market_watermark(
+                        &event.market,
+                        shard_id,
+                        event.timestamp_ms,
+                        &HashSet::new(),
+                    )?;
+                }
                 MarketEvent::MarketResolved(event) => {
                     let market = event.market;
                     let winner = event.winning_asset_id;
@@ -738,10 +746,6 @@ impl AgeRecorder {
                     resolving.extend(event.assets_ids);
                     resolving.insert(winner.clone());
                     resolving.retain(|token_id| self.tokens.contains_key(token_id));
-
-                    for token_id in &resolving {
-                        self.register_market_token(&market, shard_id, token_id)?;
-                    }
 
                     let excluded = resolving.iter().cloned().collect::<HashSet<_>>();
                     let market_watermark = self
@@ -800,7 +804,8 @@ impl AgeRecorder {
                 previous.token_ids.remove(token_id);
             }
         }
-        self.markets.retain(|_, state| !state.token_ids.is_empty());
+        self.markets
+            .retain(|key, state| key == &current_key || !state.token_ids.is_empty());
 
         self.markets
             .entry(current_key)
