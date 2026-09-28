@@ -742,7 +742,7 @@ impl AgeRecorder {
                         .filter(|((market_id, _), _)| market_id == &market)
                         .flat_map(|(_, state)| state.token_ids.iter().cloned())
                         .collect::<BTreeSet<_>>();
-                    asset_ids.extend(event.assets_ids);
+                    asset_ids.extend(event.assets_ids.unwrap_or_default());
                     if let Some(semantic_winner) = &event.winning_asset_id {
                         asset_ids.insert(semantic_winner.clone());
                     }
