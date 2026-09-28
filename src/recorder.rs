@@ -77,6 +77,197 @@ struct SeedResult {
     result: std::result::Result<Vec<RawOrderBook>, String>,
 }
 
+#[derive(Debug)]
+enum PressureState {
+    Missing,
+    Stored,
+    Loaded(PressureFrontierMemory),
+}
+
+impl PressureState {
+    fn from_store(has_pressure: bool) -> Self {
+        if has_pressure {
+            Self::Stored
+        } else {
+            Self::Missing
+        }
+    }
+
+    fn memory(&self) -> Option<&PressureFrontierMemory> {
+        match self {
+            Self::Loaded(memory) => Some(memory),
+            Self::Missing | Self::Stored => None,
+        }
+    }
+
+    fn memory_mut(&mut self) -> Option<&mut PressureFrontierMemory> {
+        match self {
+            Self::Loaded(memory) => Some(memory),
+            Self::Missing | Self::Stored => None,
+        }
+    }
+
+    fn memory_or_default(&mut self) -> Result<&mut PressureFrontierMemory> {
+        if matches!(self, Self::Missing) {
+            *self = Self::Loaded(PressureFrontierMemory::default());
+        }
+        match self {
+            Self::Loaded(memory) => Ok(memory),
+            Self::Stored => Err(anyhow!("stored pressure must be loaded before mutation")),
+            Self::Missing => unreachable!("missing pressure was initialized above"),
+        }
+    }
+
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+}
+
+#[derive(Debug)]
+enum BookState {
+    Unhydrated {
+        buffered: Vec<BufferedPriceChangeEvent>,
+    },
+    Live(AskBook),
+}
+
+impl Default for BookState {
+    fn default() -> Self {
+        Self::Unhydrated {
+            buffered: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SeedState {
+    Idle,
+    InFlight,
+    RetryAfter(i64),
+}
+
+impl SeedState {
+    fn ready(self, now_ms: i64) -> bool {
+        match self {
+            Self::Idle => true,
+            Self::InFlight => false,
+            Self::RetryAfter(retry_after_ms) => retry_after_ms <= now_ms,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WatchedTokenState {
+    recording_since_ms: Option<i64>,
+    pressure: PressureState,
+    book: BookState,
+    pending_pressure_mutations: Vec<RecorderPressureMutation>,
+    seed: SeedState,
+}
+
+impl WatchedTokenState {
+    fn new(recording_since_ms: Option<i64>, pressure: PressureState) -> Self {
+        Self {
+            recording_since_ms,
+            pressure,
+            book: BookState::default(),
+            pending_pressure_mutations: Vec::new(),
+            seed: SeedState::Idle,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompletedTokenState {
+    recording_since_ms: Option<i64>,
+    pressure: PressureState,
+    pending_pressure_mutations: Vec<RecorderPressureMutation>,
+}
+
+#[derive(Debug)]
+enum TokenState {
+    Watched(WatchedTokenState),
+    Completed(CompletedTokenState),
+}
+
+impl TokenState {
+    fn from_store(
+        status: RecorderTokenStatus,
+        recording_since_ms: Option<i64>,
+        has_pressure: bool,
+    ) -> Self {
+        let pressure = PressureState::from_store(has_pressure);
+        let recording_since_ms = has_pressure.then_some(recording_since_ms).flatten();
+        match status {
+            RecorderTokenStatus::Watched => {
+                Self::Watched(WatchedTokenState::new(recording_since_ms, pressure))
+            }
+            RecorderTokenStatus::Completed => Self::Completed(CompletedTokenState {
+                recording_since_ms,
+                pressure,
+                pending_pressure_mutations: Vec::new(),
+            }),
+        }
+    }
+
+    fn status(&self) -> RecorderTokenStatus {
+        match self {
+            Self::Watched(_) => RecorderTokenStatus::Watched,
+            Self::Completed(_) => RecorderTokenStatus::Completed,
+        }
+    }
+
+    fn is_watched(&self) -> bool {
+        matches!(self, Self::Watched(_))
+    }
+
+    fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed(_))
+    }
+
+    fn recording_since_ms(&self) -> Option<i64> {
+        match self {
+            Self::Watched(state) => state.recording_since_ms,
+            Self::Completed(state) => state.recording_since_ms,
+        }
+    }
+
+    fn recording_since_ms_mut(&mut self) -> &mut Option<i64> {
+        match self {
+            Self::Watched(state) => &mut state.recording_since_ms,
+            Self::Completed(state) => &mut state.recording_since_ms,
+        }
+    }
+
+    fn pressure(&self) -> &PressureState {
+        match self {
+            Self::Watched(state) => &state.pressure,
+            Self::Completed(state) => &state.pressure,
+        }
+    }
+
+    fn pressure_mut(&mut self) -> &mut PressureState {
+        match self {
+            Self::Watched(state) => &mut state.pressure,
+            Self::Completed(state) => &mut state.pressure,
+        }
+    }
+
+    fn pending_pressure_mutations(&self) -> &[RecorderPressureMutation] {
+        match self {
+            Self::Watched(state) => &state.pending_pressure_mutations,
+            Self::Completed(state) => &state.pending_pressure_mutations,
+        }
+    }
+
+    fn pending_pressure_mutations_mut(&mut self) -> &mut Vec<RecorderPressureMutation> {
+        match self {
+            Self::Watched(state) => &mut state.pending_pressure_mutations,
+            Self::Completed(state) => &mut state.pending_pressure_mutations,
+        }
+    }
+}
+
 enum RecorderCommand {
     State {
         token_ids: Vec<String>,
@@ -190,28 +381,21 @@ pub async fn start(store: Arc<RecorderStore>) -> Result<RecorderRuntime> {
     );
 
     for record in index {
-        match record.status {
-            RecorderTokenStatus::Watched => {
-                recorder.watched.insert(record.token_id.clone());
-            }
-            RecorderTokenStatus::Completed => {
-                recorder.completed.insert(record.token_id.clone());
-            }
-        }
-
-        if record.has_pressure {
-            recorder
-                .stored_pressure_tokens
-                .insert(record.token_id.clone());
-            if let Some(recording_since_ms) = record.recording_since_ms {
-                recorder
-                    .recording_since
-                    .insert(record.token_id, recording_since_ms);
-            }
-        }
+        recorder.tokens.insert(
+            record.token_id,
+            TokenState::from_store(
+                record.status,
+                record.recording_since_ms,
+                record.has_pressure,
+            ),
+        );
     }
 
-    let watched = recorder.watched.iter().cloned().collect::<Vec<_>>();
+    let watched = recorder
+        .tokens
+        .iter()
+        .filter_map(|(token_id, state)| state.is_watched().then_some(token_id.clone()))
+        .collect::<Vec<_>>();
     recorder.subscriptions.add(watched).await;
 
     let task = tokio::spawn(recorder.run());
@@ -225,16 +409,7 @@ struct AgeRecorder {
     store: Arc<RecorderStore>,
     rest: PolymarketRestClient,
     subscriptions: SubscriptionPool,
-    watched: HashSet<String>,
-    completed: HashSet<String>,
-    recording_since: HashMap<String, i64>,
-    books: HashMap<String, AskBook>,
-    memories: HashMap<String, PressureFrontierMemory>,
-    stored_pressure_tokens: HashSet<String>,
-    pending_price_changes: HashMap<String, Vec<BufferedPriceChangeEvent>>,
-    pending_pressure_mutations: HashMap<String, Vec<RecorderPressureMutation>>,
-    seed_in_flight: HashSet<String>,
-    seed_retry_after_ms: HashMap<String, i64>,
+    tokens: HashMap<String, TokenState>,
     dirty: BTreeSet<String>,
     command_rx: mpsc::Receiver<RecorderCommand>,
     subscription_rx: mpsc::Receiver<SubscriptionEvent>,
@@ -257,16 +432,7 @@ impl AgeRecorder {
             store,
             rest,
             subscriptions,
-            watched: HashSet::new(),
-            completed: HashSet::new(),
-            recording_since: HashMap::new(),
-            books: HashMap::new(),
-            memories: HashMap::new(),
-            stored_pressure_tokens: HashSet::new(),
-            pending_price_changes: HashMap::new(),
-            pending_pressure_mutations: HashMap::new(),
-            seed_in_flight: HashSet::new(),
-            seed_retry_after_ms: HashMap::new(),
+            tokens: HashMap::new(),
             dirty: BTreeSet::new(),
             command_rx,
             subscription_rx,
@@ -354,14 +520,14 @@ impl AgeRecorder {
     async fn watch(&mut self, token_ids: Vec<String>) -> bool {
         let mut added = Vec::new();
         for token_id in token_ids {
-            if token_id.is_empty()
-                || self.watched.contains(&token_id)
-                || self.completed.contains(&token_id)
-            {
+            if token_id.is_empty() || self.tokens.contains_key(&token_id) {
                 continue;
             }
 
-            self.watched.insert(token_id.clone());
+            self.tokens.insert(
+                token_id.clone(),
+                TokenState::Watched(WatchedTokenState::new(None, PressureState::Missing)),
+            );
             self.dirty.insert(token_id.clone());
             added.push(token_id);
         }
@@ -370,11 +536,8 @@ impl AgeRecorder {
             return false;
         }
 
-        info!(
-            tokens = added.len(),
-            watched = self.watched.len(),
-            "watching tokens"
-        );
+        let watched = self.tokens.values().filter(|state| state.is_watched()).count();
+        info!(tokens = added.len(), watched, "watching tokens");
         self.subscriptions.add(added).await;
         true
     }
@@ -392,7 +555,11 @@ impl AgeRecorder {
         if include_states {
             for token_id in &requested {
                 self.ensure_memory(token_id)?;
-                if let Some(memory) = self.memories.get(token_id) {
+                if let Some(memory) = self
+                    .tokens
+                    .get(token_id)
+                    .and_then(|state| state.pressure().memory())
+                {
                     states.insert(
                         token_id.clone(),
                         TransportState {
@@ -406,9 +573,9 @@ impl AgeRecorder {
         let recording_since_ms_by_token = requested
             .iter()
             .filter_map(|token_id| {
-                self.recording_since
+                self.tokens
                     .get(token_id)
-                    .copied()
+                    .and_then(TokenState::recording_since_ms)
                     .map(|since| (token_id.clone(), since))
             })
             .collect();
@@ -416,9 +583,9 @@ impl AgeRecorder {
         let pending_token_ids = requested
             .into_iter()
             .filter(|token_id| {
-                self.watched.contains(token_id)
-                    && !self.memories.contains_key(token_id)
-                    && !self.stored_pressure_tokens.contains(token_id)
+                self.tokens.get(token_id).is_some_and(|state| {
+                    state.is_watched() && state.pressure().is_missing()
+                })
             })
             .collect();
 
@@ -430,24 +597,47 @@ impl AgeRecorder {
     }
 
     fn stats(&self) -> Result<RecorderStats> {
-        let starts = self.recording_since.values().copied();
+        let starts = self
+            .tokens
+            .values()
+            .filter_map(TokenState::recording_since_ms);
         let oldest_recording_since_ms = starts.clone().min();
         let newest_recording_since_ms = starts.max();
         let store = self.store.stats()?;
 
         Ok(RecorderStats {
-            watched_tokens: self.watched.len(),
-            completed_tokens: self.completed.len(),
-            hydrated_tokens: self.memories.len(),
-            live_books: self.books.len(),
+            watched_tokens: self.tokens.values().filter(|state| state.is_watched()).count(),
+            completed_tokens: self
+                .tokens
+                .values()
+                .filter(|state| state.is_completed())
+                .count(),
+            hydrated_tokens: self
+                .tokens
+                .values()
+                .filter(|state| state.pressure().memory().is_some())
+                .count(),
+            live_books: self
+                .tokens
+                .values()
+                .filter(|state| {
+                    matches!(
+                        state,
+                        TokenState::Watched(WatchedTokenState {
+                            book: BookState::Live(_),
+                            ..
+                        })
+                    )
+                })
+                .count(),
             subscription_connections: self.subscriptions.active_connection_count(),
             connected_subscription_connections: self.subscriptions.connected_connection_count(),
             assigned_subscription_tokens: self.subscriptions.assigned_token_count(),
             dirty_tokens: self.dirty.len(),
             pending_pressure_mutations: self
-                .pending_pressure_mutations
+                .tokens
                 .values()
-                .map(Vec::len)
+                .map(|state| state.pending_pressure_mutations().len())
                 .sum(),
             oldest_recording_since_ms,
             newest_recording_since_ms,
@@ -462,17 +652,16 @@ impl AgeRecorder {
         let candidates = token_ids
             .iter()
             .filter(|token_id| {
-                self.watched.contains(*token_id)
-                    && !self.completed.contains(*token_id)
-                    && !self.memories.contains_key(*token_id)
-                    && !self.stored_pressure_tokens.contains(*token_id)
-                    && !self.seed_in_flight.contains(*token_id)
-                    && self
-                        .seed_retry_after_ms
-                        .get(*token_id)
-                        .copied()
-                        .unwrap_or(0)
-                        <= now
+                self.tokens.get(*token_id).is_some_and(|state| {
+                    matches!(
+                        state,
+                        TokenState::Watched(WatchedTokenState {
+                            pressure: PressureState::Missing,
+                            seed,
+                            ..
+                        }) if seed.ready(now)
+                    )
+                })
             })
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -484,7 +673,9 @@ impl AgeRecorder {
         {
             let token_ids = batch.to_vec();
             for token_id in &token_ids {
-                self.seed_in_flight.insert(token_id.clone());
+                if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
+                    state.seed = SeedState::InFlight;
+                }
             }
 
             let rest = self.rest.clone();
@@ -507,52 +698,71 @@ impl AgeRecorder {
     }
 
     fn consume_seed_result(&mut self, seed: SeedResult) -> Result<()> {
-        match seed.result {
+        let SeedResult {
+            token_ids,
+            requested_at_ms,
+            result,
+        } = seed;
+
+        match result {
             Ok(snapshots) => {
+                for token_id in &token_ids {
+                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
+                        state.seed = SeedState::Idle;
+                    }
+                }
+
                 for snapshot in snapshots {
                     let token_id = snapshot.asset_id.clone();
-                    if !self.watched.contains(&token_id)
-                        || self.completed.contains(&token_id)
-                        || self.memories.contains_key(&token_id)
-                    {
-                        continue;
-                    }
+                    let buffered = {
+                        let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id) else {
+                            continue;
+                        };
+                        if state.pressure.memory().is_some() {
+                            continue;
+                        }
+                        match &mut state.book {
+                            BookState::Unhydrated { buffered } => std::mem::take(buffered),
+                            BookState::Live(_) => Vec::new(),
+                        }
+                    };
 
-                    let snapshot_ms = seed.requested_at_ms.max(event_timestamp_ms(
+                    let snapshot_ms = requested_at_ms.max(event_timestamp_ms(
                         snapshot.timestamp.as_ref(),
-                        seed.requested_at_ms,
+                        requested_at_ms,
                     ));
                     let mut book = AskBook::from_snapshot(&snapshot.asks)?;
                     let levels = book.pressure_levels();
-                    self.books.insert(token_id.clone(), book.clone());
                     self.update_memory_replace(&token_id, levels, snapshot_ms)?;
 
-                    if let Some(buffered) = self.pending_price_changes.remove(&token_id) {
-                        for event in buffered {
-                            if event.timestamp_ms <= snapshot_ms {
-                                continue;
-                            }
-                            let changes = apply_book_changes(&mut book, &event.changes)?;
-                            self.update_memory_changes(&token_id, changes, event.timestamp_ms)?;
+                    for event in buffered {
+                        if event.timestamp_ms <= snapshot_ms {
+                            continue;
                         }
-                        self.books.insert(token_id, book);
+                        let changes = apply_book_changes(&mut book, &event.changes)?;
+                        self.update_memory_changes(&token_id, changes, event.timestamp_ms)?;
+                    }
+
+                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id) {
+                        state.book = BookState::Live(book);
                     }
                 }
             }
             Err(message) => {
                 let retry_at = now_ms() + REST_SEED_RETRY.as_millis() as i64;
-                warn!(error = %message, tokens = seed.token_ids.len(), "REST seed failed");
-                for token_id in &seed.token_ids {
-                    if !self.memories.contains_key(token_id) {
-                        self.seed_retry_after_ms.insert(token_id.clone(), retry_at);
+                warn!(error = %message, tokens = token_ids.len(), "REST seed failed");
+                for token_id in &token_ids {
+                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
+                        state.seed = if state.pressure.memory().is_some() {
+                            SeedState::Idle
+                        } else {
+                            SeedState::RetryAfter(retry_at)
+                        };
                     }
                 }
             }
         }
 
-        for token_id in seed.token_ids {
-            self.seed_in_flight.remove(&token_id);
-        }
         Ok(())
     }
 
@@ -560,8 +770,9 @@ impl AgeRecorder {
         match event {
             SubscriptionEvent::ContinuityLost { token_ids } => {
                 for token_id in &token_ids {
-                    self.books.remove(token_id);
-                    self.pending_price_changes.remove(token_id);
+                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
+                        state.book = BookState::default();
+                    }
                 }
                 debug!(tokens = token_ids.len(), "subscription continuity lost");
             }
@@ -571,26 +782,35 @@ impl AgeRecorder {
             } => match event {
                 MarketEvent::Book(event) => {
                     let token_id = event.asset_id;
-                    if !self.watched.contains(&token_id) {
+                    if !self
+                        .tokens
+                        .get(&token_id)
+                        .is_some_and(TokenState::is_watched)
+                    {
                         return Ok(());
                     }
 
                     let book = AskBook::from_snapshot(&event.asks)?;
                     let levels = book.pressure_levels();
-                    self.books.insert(token_id.clone(), book);
-                    self.pending_price_changes.remove(&token_id);
                     let valid_through_ms = snapshot_requested_at_ms.max(event_timestamp_ms(
                         event.timestamp.as_ref(),
                         snapshot_requested_at_ms,
                     ));
                     self.update_memory_replace(&token_id, levels, valid_through_ms)?;
+                    if let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id) {
+                        state.book = BookState::Live(book);
+                    }
                 }
                 MarketEvent::PriceChange(event) => {
                     let timestamp_ms = event_timestamp_ms(event.timestamp.as_ref(), now_ms());
                     let mut by_token = BTreeMap::<String, Vec<RawPriceChange>>::new();
 
                     for change in event.price_changes {
-                        if self.watched.contains(&change.asset_id) {
+                        if self
+                            .tokens
+                            .get(&change.asset_id)
+                            .is_some_and(TokenState::is_watched)
+                        {
                             by_token
                                 .entry(change.asset_id.clone())
                                 .or_default()
@@ -599,40 +819,74 @@ impl AgeRecorder {
                     }
 
                     for (token_id, changes) in by_token {
-                        let Some(book) = self.books.get_mut(&token_id) else {
-                            self.pending_price_changes
-                                .entry(token_id)
-                                .or_default()
-                                .push(BufferedPriceChangeEvent {
-                                    timestamp_ms,
-                                    changes,
-                                });
-                            continue;
+                        let pressure_changes = {
+                            let Some(TokenState::Watched(state)) =
+                                self.tokens.get_mut(&token_id)
+                            else {
+                                continue;
+                            };
+                            match &mut state.book {
+                                BookState::Live(book) => {
+                                    Some(apply_book_changes(book, &changes)?)
+                                }
+                                BookState::Unhydrated { buffered } => {
+                                    buffered.push(BufferedPriceChangeEvent {
+                                        timestamp_ms,
+                                        changes,
+                                    });
+                                    None
+                                }
+                            }
                         };
 
-                        let pressure_changes = apply_book_changes(book, &changes)?;
-                        self.update_memory_changes(&token_id, pressure_changes, timestamp_ms)?;
+                        if let Some(pressure_changes) = pressure_changes {
+                            self.update_memory_changes(
+                                &token_id,
+                                pressure_changes,
+                                timestamp_ms,
+                            )?;
+                        }
                     }
                 }
                 MarketEvent::MarketResolved(event) => {
                     let mut removed = Vec::new();
                     for token_id in event.assets_ids.unwrap_or_default() {
-                        self.ensure_memory(&token_id)?;
-                        if let Some(memory) = self.memories.get_mut(&token_id) {
-                            memory.clear();
-                            self.pending_pressure_mutations
-                                .entry(token_id.clone())
-                                .or_default()
-                                .push(RecorderPressureMutation::Clear);
+                        if self.tokens.contains_key(&token_id) {
+                            self.ensure_memory(&token_id)?;
                         }
 
-                        if self.watched.remove(&token_id) {
-                            removed.push(token_id.clone());
-                        }
-                        self.completed.insert(token_id.clone());
-                        self.books.remove(&token_id);
-                        self.pending_price_changes.remove(&token_id);
-                        self.seed_retry_after_ms.remove(&token_id);
+                        let next = match self.tokens.remove(&token_id) {
+                            Some(TokenState::Watched(mut state)) => {
+                                if let Some(memory) = state.pressure.memory_mut() {
+                                    memory.clear();
+                                    state
+                                        .pending_pressure_mutations
+                                        .push(RecorderPressureMutation::Clear);
+                                }
+                                removed.push(token_id.clone());
+                                TokenState::Completed(CompletedTokenState {
+                                    recording_since_ms: state.recording_since_ms,
+                                    pressure: state.pressure,
+                                    pending_pressure_mutations: state.pending_pressure_mutations,
+                                })
+                            }
+                            Some(TokenState::Completed(mut state)) => {
+                                if let Some(memory) = state.pressure.memory_mut() {
+                                    memory.clear();
+                                    state
+                                        .pending_pressure_mutations
+                                        .push(RecorderPressureMutation::Clear);
+                                }
+                                TokenState::Completed(state)
+                            }
+                            None => TokenState::Completed(CompletedTokenState {
+                                recording_since_ms: None,
+                                pressure: PressureState::Missing,
+                                pending_pressure_mutations: Vec::new(),
+                            }),
+                        };
+
+                        self.tokens.insert(token_id.clone(), next);
                         self.dirty.insert(token_id);
                     }
 
@@ -648,19 +902,22 @@ impl AgeRecorder {
     fn update_memory_replace(
         &mut self,
         token_id: &str,
-        levels: Vec<crate::pressure::PressureLevel>,
+        levels: Vec<PressureLevel>,
         valid_through_ms: i64,
     ) -> Result<()> {
         self.ensure_memory(token_id)?;
-        let memory = self.memories.entry(token_id.to_owned()).or_default();
+        let state = self
+            .tokens
+            .get_mut(token_id)
+            .ok_or_else(|| anyhow!("cannot update unknown token {token_id}"))?;
+        let memory = state.pressure_mut().memory_or_default()?;
 
         if !memory.observe_levels(&levels, valid_through_ms)? {
             return Ok(());
         }
 
-        self.pending_pressure_mutations
-            .entry(token_id.to_owned())
-            .or_default()
+        state
+            .pending_pressure_mutations_mut()
             .push(RecorderPressureMutation::Replace {
                 valid_through_ms,
                 levels,
@@ -676,7 +933,11 @@ impl AgeRecorder {
         valid_through_ms: i64,
     ) -> Result<()> {
         self.ensure_memory(token_id)?;
-        let memory = self.memories.entry(token_id.to_owned()).or_default();
+        let state = self
+            .tokens
+            .get_mut(token_id)
+            .ok_or_else(|| anyhow!("cannot update unknown token {token_id}"))?;
+        let memory = state.pressure_mut().memory_or_default()?;
 
         let mut mutated = memory.update_levels(&changes, valid_through_ms)?;
         if memory.observe_through(valid_through_ms)? {
@@ -686,9 +947,8 @@ impl AgeRecorder {
             return Ok(());
         }
 
-        self.pending_pressure_mutations
-            .entry(token_id.to_owned())
-            .or_default()
+        state
+            .pending_pressure_mutations_mut()
             .push(RecorderPressureMutation::Update {
                 valid_through_ms,
                 changes,
@@ -698,32 +958,41 @@ impl AgeRecorder {
     }
 
     fn finish_memory_update(&mut self, token_id: &str, valid_through_ms: i64) {
-        if !self.recording_since.contains_key(token_id) {
-            self.recording_since
-                .insert(token_id.to_owned(), valid_through_ms);
+        let Some(state) = self.tokens.get_mut(token_id) else {
+            return;
+        };
+        if state.recording_since_ms().is_none() {
+            *state.recording_since_ms_mut() = Some(valid_through_ms);
             info!(token = %short_token(token_id), "recorded first snapshot");
         }
         self.dirty.insert(token_id.to_owned());
     }
 
     fn ensure_memory(&mut self, token_id: &str) -> Result<()> {
-        if self.memories.contains_key(token_id) || !self.stored_pressure_tokens.contains(token_id) {
+        let should_load = self
+            .tokens
+            .get(token_id)
+            .is_some_and(|state| matches!(state.pressure(), PressureState::Stored));
+        if !should_load {
             return Ok(());
         }
 
-        match self.store.load_pressure(token_id)? {
+        let pressure = self.store.load_pressure(token_id)?;
+        let Some(state) = self.tokens.get_mut(token_id) else {
+            return Ok(());
+        };
+
+        match pressure {
             Some(snapshot) => {
-                self.memories.insert(
-                    token_id.to_owned(),
-                    PressureFrontierMemory::restore(snapshot)?,
-                );
+                *state.pressure_mut() =
+                    PressureState::Loaded(PressureFrontierMemory::restore(snapshot)?);
             }
             None => {
-                self.recording_since.remove(token_id);
+                *state.pressure_mut() = PressureState::Missing;
+                *state.recording_since_ms_mut() = None;
                 self.dirty.insert(token_id.to_owned());
             }
         }
-        self.stored_pressure_tokens.remove(token_id);
         Ok(())
     }
 
@@ -736,24 +1005,27 @@ impl AgeRecorder {
         let mut writes = Vec::with_capacity(token_ids.len());
 
         for token_id in &token_ids {
-            let mutations = self
-                .pending_pressure_mutations
+            let state = self
+                .tokens
                 .get(token_id)
-                .cloned()
-                .unwrap_or_default();
-            let completed = self.completed.contains(token_id);
+                .ok_or_else(|| anyhow!("dirty token {token_id} has no state"))?;
+            let mutations = state.pending_pressure_mutations().to_vec();
+            let completed = state.is_completed();
+            let status = state.status();
+            let recording_since_ms = state.recording_since_ms();
             let should_checkpoint =
                 completed || self.store.should_checkpoint(token_id, mutations.len())?;
 
             let (mutations, checkpoint) = if should_checkpoint {
                 self.ensure_memory(token_id)?;
+                let snapshot = self
+                    .tokens
+                    .get(token_id)
+                    .and_then(|state| state.pressure().memory())
+                    .map(PressureFrontierMemory::snapshot);
                 (
                     Vec::new(),
-                    RecorderCheckpointWrite::Replace(
-                        self.memories
-                            .get(token_id)
-                            .map(PressureFrontierMemory::snapshot),
-                    ),
+                    RecorderCheckpointWrite::Replace(snapshot),
                 )
             } else {
                 (mutations, RecorderCheckpointWrite::Keep)
@@ -761,12 +1033,8 @@ impl AgeRecorder {
 
             writes.push(RecorderStoreWriteRecord {
                 token_id: token_id.clone(),
-                status: if completed {
-                    RecorderTokenStatus::Completed
-                } else {
-                    RecorderTokenStatus::Watched
-                },
-                recording_since_ms: self.recording_since.get(token_id).copied(),
+                status,
+                recording_since_ms,
                 mutations,
                 checkpoint,
             });
@@ -774,7 +1042,9 @@ impl AgeRecorder {
 
         let stats = self.store.write(&writes)?;
         for token_id in token_ids {
-            self.pending_pressure_mutations.remove(&token_id);
+            if let Some(state) = self.tokens.get_mut(&token_id) {
+                state.pending_pressure_mutations_mut().clear();
+            }
             self.dirty.remove(&token_id);
         }
 
