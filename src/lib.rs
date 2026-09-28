@@ -2,6 +2,7 @@ pub mod api;
 pub mod book;
 pub mod polymarket;
 pub mod pressure;
+pub(crate) mod proto;
 pub mod pressure_log;
 pub mod recorder;
 pub mod store;

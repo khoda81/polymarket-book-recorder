@@ -3,12 +3,7 @@ use prost::Message;
 
 use crate::pressure::{PRICE_SCALE, PressureFrontierMemory, PressureLevel};
 
-mod wire {
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/polymarket_book_recorder.pressure.v7.rs"
-    ));
-}
+use crate::proto as wire;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RecorderPressureMutation {
