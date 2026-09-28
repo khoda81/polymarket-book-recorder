@@ -227,7 +227,6 @@ impl TokenState {
             Self::Completed(state) => &mut state.pending_pressure_mutations,
         }
     }
-
 }
 
 enum RecorderCommand {
@@ -613,7 +612,11 @@ impl AgeRecorder {
                         market.watermark_ms = None;
                     }
                 }
-                debug!(shard_id, tokens = token_ids.len(), "subscription continuity lost");
+                debug!(
+                    shard_id,
+                    tokens = token_ids.len(),
+                    "subscription continuity lost"
+                );
             }
             SubscriptionEvent::Market {
                 shard_id,
@@ -656,17 +659,13 @@ impl AgeRecorder {
                                 short_token(&token_id)
                             )
                         })?;
-                        let valid_through_ms =
-                            market_watermark.map_or(requested_at_ms, |value| value.max(requested_at_ms));
+                        let valid_through_ms = market_watermark
+                            .map_or(requested_at_ms, |value| value.max(requested_at_ms));
                         self.update_memory_snapshot(&token_id, levels, valid_through_ms)?;
                     } else {
                         let valid_through_ms =
                             self.token_event_watermark(&token_id, market_watermark)?;
-                        self.update_memory_continuous_replace(
-                            &token_id,
-                            levels,
-                            valid_through_ms,
-                        )?;
+                        self.update_memory_continuous_replace(&token_id, levels, valid_through_ms)?;
                     }
 
                     if let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id) {
@@ -792,11 +791,7 @@ impl AgeRecorder {
                         } else {
                             None
                         };
-                        if self.complete_token(
-                            &token_id,
-                            unbounded,
-                            resolved_at_ms,
-                        )? {
+                        if self.complete_token(&token_id, unbounded, resolved_at_ms)? {
                             removed.push(token_id);
                         }
                     }
@@ -873,12 +868,7 @@ impl AgeRecorder {
         };
 
         if let Some(watermark_ms) = watermark_ms {
-            self.advance_market_through(
-                market_id,
-                shard_id,
-                watermark_ms,
-                excluded_tokens,
-            )?;
+            self.advance_market_through(market_id, shard_id, watermark_ms, excluded_tokens)?;
         }
         Ok(watermark_ms)
     }

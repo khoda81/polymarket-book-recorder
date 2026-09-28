@@ -29,9 +29,7 @@ pub enum RecorderPressureMutation {
         changes: Vec<PressureLevel>,
     },
     /// Ordered market evidence that does not change this token's levels.
-    Advance {
-        valid_through_ms: i64,
-    },
+    Advance { valid_through_ms: i64 },
     /// Complete book replacement on a known-continuous stream.
     ReplaceContinuous {
         valid_through_ms: i64,
@@ -111,8 +109,7 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
         ensure!(price <= PRICE_SCALE, "price ticks must be in [0, 10000]");
         if !shares.is_finite()
             || shares < 0.0
-            || ((kind == MUTATION_REPLACE || kind == MUTATION_REPLACE_CONTINUOUS)
-                && shares <= 0.0)
+            || ((kind == MUTATION_REPLACE || kind == MUTATION_REPLACE_CONTINUOUS) && shares <= 0.0)
         {
             bail!("invalid pressure mutation shares");
         }
