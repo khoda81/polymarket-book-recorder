@@ -1,10 +1,11 @@
 use axum::{
     Json, Router,
     extract::{RawQuery, State},
-    http::{Method, header},
+    http::{HeaderValue, Method, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -55,14 +56,39 @@ async fn health(State(state): State<AppState>) -> Result<Json<RecorderStats>, Ap
 async fn state(
     State(state): State<AppState>,
     RawQuery(raw_query): RawQuery,
-) -> Result<Json<crate::recorder::RecorderStateResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let query = StateQuery::parse(raw_query.as_deref());
-    Ok(Json(
-        state
-            .recorder
-            .state(query.token_ids, !query.metadata_only)
-            .await?,
-    ))
+    let state = state
+        .recorder
+        .state(query.token_ids, !query.metadata_only)
+        .await?;
+
+    let message = crate::proto::RecorderStateResponse {
+        recording_since_ms_by_token: state
+            .recording_since_ms_by_token
+            .into_iter()
+            .collect(),
+        states: state
+            .states
+            .into_iter()
+            .map(|(token_id, state)| {
+                (
+                    token_id,
+                    crate::proto::TokenPressureState {
+                        pressure: Some(state.pressure.to_proto()),
+                    },
+                )
+            })
+            .collect(),
+        pending_token_ids: state.pending_token_ids,
+    };
+
+    let mut response = message.encode_to_vec().into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-protobuf"),
+    );
+    Ok(response)
 }
 
 async fn watch(
