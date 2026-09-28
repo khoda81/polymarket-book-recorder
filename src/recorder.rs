@@ -1072,19 +1072,24 @@ impl AgeRecorder {
         };
 
         let memory = state.pressure.memory_or_default()?;
-        let resolved_at_ms = match (memory.valid_through_ms(), resolved_at_ms) {
-            (Some(current), Some(resolved)) => Some(current.max(resolved)),
-            (Some(current), None) => Some(current),
-            (None, resolved) => resolved,
-        };
-        if unbounded {
-            memory.resolve_unbounded(resolved_at_ms)?;
+        let current_watermark_ms = memory.valid_through_ms();
+        let pressure_resolved_at_ms = if unbounded {
+            match (current_watermark_ms, resolved_at_ms) {
+                (Some(current), Some(resolved)) if resolved < current => None,
+                _ => resolved_at_ms,
+            }
         } else {
-            memory.resolve_zero_future(resolved_at_ms)?;
+            resolved_at_ms
+        };
+
+        if unbounded {
+            memory.resolve_unbounded(pressure_resolved_at_ms)?;
+        } else {
+            memory.resolve_zero_future(pressure_resolved_at_ms)?;
         }
 
         if state.recording_since_ms.is_none() {
-            state.recording_since_ms = resolved_at_ms;
+            state.recording_since_ms = current_watermark_ms.or(resolved_at_ms);
         }
 
         self.tokens.insert(
