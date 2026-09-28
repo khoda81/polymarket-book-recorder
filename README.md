@@ -2,17 +2,22 @@
 
 Rust recorder backend for [Polymarket Viz](https://github.com/khoda81/polymarket-book-vis).
 
-The recorder persists canonical v6 pressure state. Existing databases must
-already be schema version 6; older database versions are rejected.
+The recorder persists canonical v7 pressure snapshots in the existing SQLite
+schema version 6. Persisted v6 pressure snapshots and mutation tails remain
+readable; older database schemas are rejected.
 
 ## Features
 
-- Polymarket CLOB REST book seeding
 - Polymarket market WebSocket subscriptions, heartbeat, reconnect, and
   continuity invalidation
+- WebSocket-only causal book bootstrap; REST snapshots are never merged into
+  an in-flight market stream
+- market-local, stream-local watermark propagation from ordered market events
+- terminal unbounded pressure for resolved winners, with dominated history
+  removed and opposing historical pressure preserved
 - exact integer price ticks
 - token-local ask-book pressure tracking
-- v6 pressure history as exact per-price current shares + frozen cumulative upper-edge steps
+- v7 pressure history as exact per-price current shares + frozen cumulative upper-edge steps
 - cumulative current pressure derived by prefix sum; lower historical edges are implicit
 - no duplicated current frontier and no persisted lower band edges
 - SQLite schema version 6
@@ -25,9 +30,9 @@ already be schema version 6; older database versions are rejected.
 - `POST /api/recorder/watch`
 - graceful SIGINT/SIGTERM flush
 
-The recorder owns mutable market state in one Tokio actor. WebSocket shards and
-REST seed requests feed that actor through channels, so the hot book/pressure
-state does not need shared locks.
+The recorder owns mutable market state in one Tokio actor. WebSocket shards
+feed that actor through channels, so the hot book/pressure state does not need
+shared locks.
 
 ## Run
 
