@@ -1,72 +1,11 @@
 use anyhow::{Context, Result};
 use serde::de;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::book::RawBookLevel;
 
-pub const DEFAULT_CLOB_REST_URL: &str = "https://clob.polymarket.com";
 pub const DEFAULT_CLOB_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-
-#[derive(Debug, Clone)]
-pub struct PolymarketRestClient {
-    client: Client,
-    base_url: String,
-}
-
-impl Default for PolymarketRestClient {
-    fn default() -> Self {
-        Self::new(DEFAULT_CLOB_REST_URL)
-    }
-}
-
-impl PolymarketRestClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            client: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-        }
-    }
-
-    pub async fn fetch_order_books(&self, token_ids: &[String]) -> Result<Vec<RawOrderBook>> {
-        if token_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let body = token_ids
-            .iter()
-            .map(|token_id| TokenRequest {
-                token_id: token_id.as_str(),
-            })
-            .collect::<Vec<_>>();
-
-        self.client
-            .post(format!("{}/books", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .context("requesting Polymarket order books")?
-            .error_for_status()
-            .context("Polymarket order-books request failed")?
-            .json::<Vec<RawOrderBook>>()
-            .await
-            .context("decoding Polymarket order books")
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct TokenRequest<'a> {
-    token_id: &'a str,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RawOrderBook {
-    pub asset_id: String,
-    #[serde(default)]
-    pub asks: Vec<RawBookLevel>,
-    pub timestamp: Option<Value>,
-}
 
 #[derive(Debug, Clone)]
 pub enum MarketEvent {
@@ -251,8 +190,10 @@ mod tests {
             [MarketEvent::Book(_)]
         ));
 
-        let array = format!(r#"[{book},{{"event_type":"last_trade_price","asset_id":"123"}}]"#);
-        assert_eq!(parse_market_message(&array).unwrap().len(), 1);
+        let array = format!(
+            r#"[{book},{{"event_type":"last_trade_price","market":"0xabc","asset_id":"123","timestamp":"1001"}}]"#
+        );
+        assert_eq!(parse_market_message(&array).unwrap().len(), 2);
     }
 
     #[test]
