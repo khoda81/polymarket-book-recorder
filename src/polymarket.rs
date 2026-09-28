@@ -65,7 +65,7 @@ pub struct RawPriceChange {
 pub struct MarketResolvedEvent {
     pub market: String,
     #[serde(default)]
-    pub assets_ids: Vec<String>,
+    pub assets_ids: Option<Vec<String>>,
     pub winning_asset_id: Option<String>,
     #[serde(
         default,
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_requires_winner_and_timestamp() {
+    fn resolution_accepts_partial_terminal_metadata() {
         let valid = r#"{
           "event_type":"market_resolved",
           "market":"0xabc",
