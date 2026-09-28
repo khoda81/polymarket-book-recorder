@@ -100,7 +100,11 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
 
     for (price, shares) in entries {
         ensure!(price <= PRICE_SCALE, "price ticks must be in [0, 10000]");
-        if !shares.is_finite() || shares < 0.0 || (kind == MUTATION_REPLACE && shares <= 0.0) {
+        if !shares.is_finite()
+            || shares < 0.0
+            || ((kind == MUTATION_REPLACE || kind == MUTATION_REPLACE_CONTINUOUS)
+                && shares <= 0.0)
+        {
             bail!("invalid pressure mutation shares");
         }
         bytes.extend_from_slice(&price.to_le_bytes());
@@ -193,7 +197,10 @@ pub fn decode_pressure_mutation(value: &[u8]) -> Result<RecorderPressureMutation
         let shares = f64::from_le_bytes(value[offset + 2..offset + 10].try_into()?);
         ensure!(price <= PRICE_SCALE, "price ticks must be in [0, 10000]");
         ensure!(
-            shares.is_finite() && shares >= 0.0 && (kind != MUTATION_REPLACE || shares > 0.0),
+            shares.is_finite()
+                && shares >= 0.0
+                && ((kind != MUTATION_REPLACE && kind != MUTATION_REPLACE_CONTINUOUS)
+                    || shares > 0.0),
             "invalid pressure mutation shares"
         );
         entries.push((price, shares));
@@ -237,6 +244,25 @@ mod tests {
             RecorderPressureMutation::Clear
         );
         assert!(decode_pressure_mutation(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn advance_and_continuous_replace_round_trip() {
+        for mutation in [
+            RecorderPressureMutation::Advance {
+                valid_through_ms: 2_000,
+            },
+            RecorderPressureMutation::ReplaceContinuous {
+                valid_through_ms: 3_000,
+                levels: vec![PressureLevel {
+                    price: 5_000,
+                    shares: 12.0,
+                }],
+            },
+        ] {
+            let encoded = encode_pressure_mutation(&mutation).unwrap();
+            assert_eq!(decode_pressure_mutation(&encoded).unwrap(), mutation);
+        }
     }
 
     #[test]
