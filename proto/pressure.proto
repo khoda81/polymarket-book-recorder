@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package polymarket_book_recorder.pressure.v7;
+
+message PressureLevel {
+  uint32 price = 1;
+  double shares = 2;
+}
+
+message ObserveSnapshot {
+  optional int64 valid_through_ms = 1;
+  repeated PressureLevel levels = 2;
+}
+
+message ApplyDelta {
+  optional int64 valid_through_ms = 1;
+  repeated PressureLevel changes = 2;
+}
+
+message Advance {
+  optional int64 valid_through_ms = 1;
+}
+
+message ReplaceContinuous {
+  optional int64 valid_through_ms = 1;
+  repeated PressureLevel levels = 2;
+}
+
+message PressureMutation {
+  oneof kind {
+    ObserveSnapshot observe_snapshot = 1;
+    ApplyDelta apply_delta = 2;
+    Advance advance = 3;
+    ReplaceContinuous replace_continuous = 4;
+  }
+}
