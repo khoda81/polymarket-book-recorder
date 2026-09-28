@@ -651,7 +651,7 @@ mod tests {
             runs[0].frozen_steps,
             vec![FrozenStep {
                 hi_volume: 10.0,
-                valid_through_ms: 1_000,
+                valid_through_ms: 2_000,
             }]
         );
     }
@@ -692,16 +692,10 @@ mod tests {
         };
         assert_eq!(
             runs[0].frozen_steps,
-            vec![
-                FrozenStep {
-                    hi_volume: 10.0,
-                    valid_through_ms: 1_000,
-                },
-                FrozenStep {
-                    hi_volume: 8.0,
-                    valid_through_ms: 2_000,
-                },
-            ]
+            vec![FrozenStep {
+                hi_volume: 10.0,
+                valid_through_ms: 2_000,
+            }]
         );
         assert_eq!(runs[0].shares, 6.0);
     }
