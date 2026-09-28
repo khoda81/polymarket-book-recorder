@@ -1,5 +1,6 @@
 pub mod api;
 pub mod book;
+pub mod fees;
 pub mod polymarket;
 pub mod pressure;
 pub mod pressure_log;
