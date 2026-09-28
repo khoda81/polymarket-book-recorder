@@ -128,7 +128,7 @@ impl PressureFrontierMemory {
         }
     }
 
-    /// Install a complete observation without claiming continuity from the    /// Install a complete observation without claiming continuity from the
+    /// Install a complete observation without claiming continuity from the
     /// previous current frontier to this observation.
     pub fn observe_levels(
         &mut self,
@@ -197,7 +197,7 @@ impl PressureFrontierMemory {
         Ok(true)
     }
 
-    /// Replace the complete frontier on a continuous ordered stream.    /// Replace the complete frontier on a continuous ordered stream.
+    /// Replace the complete frontier on a continuous ordered stream.
     pub fn replace_continuous(
         &mut self,
         levels: &[PressureLevel],

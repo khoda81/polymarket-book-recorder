@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -327,6 +327,107 @@ fn max_with_current(memory: &PressureFrontierMemory, timestamp_ms: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_v6_database_is_collapsed_into_one_v7_checkpoint() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE token_state (
+                    token_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK (status IN ('watched', 'completed')),
+                    recording_since_ms INTEGER,
+                    pressure BLOB
+                ) WITHOUT ROWID;
+                CREATE TABLE pressure_log (
+                    seq INTEGER PRIMARY KEY,
+                    token_id TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    FOREIGN KEY(token_id) REFERENCES token_state(token_id)
+                        ON DELETE CASCADE
+                );
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .unwrap();
+
+        let legacy_json = serde_json::json!({
+            "version": 6,
+            "state": {
+                "kind": "observed",
+                "validThroughMs": 1_001,
+                "runs": [{
+                    "price": 5_000,
+                    "shares": 10.0,
+                    "frozenSteps": []
+                }]
+            }
+        });
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        serde_json::to_writer(&mut encoder, &legacy_json).unwrap();
+        let checkpoint = encoder.finish().unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO token_state(token_id, status, recording_since_ms, pressure)
+                 VALUES (?1, 'watched', 1000, ?2)",
+                params!["token", checkpoint],
+            )
+            .unwrap();
+
+        let mut legacy_delta = Vec::new();
+        legacy_delta.push(MUTATION_UPDATE_V6);
+        legacy_delta.extend_from_slice(&1_000_i64.to_le_bytes());
+        legacy_delta.extend_from_slice(&1_u16.to_le_bytes());
+        legacy_delta.extend_from_slice(&5_000_u16.to_le_bytes());
+        legacy_delta.extend_from_slice(&4.0_f64.to_le_bytes());
+        connection
+            .execute(
+                "INSERT INTO pressure_log(seq, token_id, payload) VALUES (1, 'token', ?1)",
+                [legacy_delta],
+            )
+            .unwrap();
+
+        migrate_database_v6_to_v7(&mut connection).unwrap();
+
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, 7);
+
+        let mutation_count = connection
+            .query_row("SELECT COUNT(*) FROM pressure_log", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(mutation_count, 0);
+
+        let checkpoint = connection
+            .query_row(
+                "SELECT pressure FROM token_state WHERE token_id = 'token'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        let mut decoder = GzDecoder::new(checkpoint.as_slice());
+        let mut json = String::new();
+        decoder.read_to_string(&mut json).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["version"], 7);
+        assert_eq!(value["state"]["validThroughMs"], 1_001);
+        assert_eq!(value["state"]["runs"][0]["shares"], 4.0);
+        assert_eq!(
+            value["state"]["runs"][0]["frozenSteps"][0]["hiVolume"],
+            10.0
+        );
+        assert_eq!(
+            value["state"]["runs"][0]["frozenSteps"][0]["validThroughMs"],
+            1_001
+        );
+    }
 
     #[test]
     fn legacy_v6_delta_keeps_old_freeze_semantics_and_maxes_raw_time() {
