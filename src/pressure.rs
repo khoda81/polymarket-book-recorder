@@ -33,7 +33,7 @@ enum SnapshotState {
         valid_through_ms: i64,
         runs: Vec<PressureRun>,
     },
-    ResolvedWinner {
+    ResolvedUnbounded {
         #[serde(rename = "resolvedAtMs")]
         resolved_at_ms: i64,
     },
@@ -71,7 +71,7 @@ enum MemoryState {
         valid_through_ms: i64,
         runs: Vec<PressureRun>,
     },
-    ResolvedWinner {
+    ResolvedUnbounded {
         resolved_at_ms: i64,
     },
 }
@@ -109,12 +109,12 @@ impl PressureFrontierMemory {
                     runs,
                 }
             }
-            SnapshotState::ResolvedWinner { resolved_at_ms } => {
+            SnapshotState::ResolvedUnbounded { resolved_at_ms } => {
                 ensure!(
                     resolved_at_ms >= 0,
-                    "pressure winner resolution timestamp must be non-negative"
+                    "pressure unbounded resolution timestamp must be non-negative"
                 );
-                MemoryState::ResolvedWinner { resolved_at_ms }
+                MemoryState::ResolvedUnbounded { resolved_at_ms }
             }
         };
 
@@ -131,8 +131,8 @@ impl PressureFrontierMemory {
                 valid_through_ms: *valid_through_ms,
                 runs: runs.clone(),
             },
-            MemoryState::ResolvedWinner { resolved_at_ms } => {
-                SnapshotState::ResolvedWinner {
+            MemoryState::ResolvedUnbounded { resolved_at_ms } => {
+                SnapshotState::ResolvedUnbounded {
                     resolved_at_ms: *resolved_at_ms,
                 }
             }
@@ -228,7 +228,7 @@ impl PressureFrontierMemory {
     }
 
     pub fn observe_through(&mut self, valid_through_ms: i64) -> Result<bool> {
-        if matches!(self.state, MemoryState::ResolvedWinner { .. }) {
+        if matches!(self.state, MemoryState::ResolvedUnbounded { .. }) {
             return Ok(false);
         }
         let valid_through_ms = self.require_monotonic_time(valid_through_ms)?;
@@ -242,19 +242,19 @@ impl PressureFrontierMemory {
     }
 
     /// Resolution to this token dominates every finite historical offer.
-    pub fn resolve_winner(&mut self, resolved_at_ms: i64) -> Result<bool> {
-        if matches!(self.state, MemoryState::ResolvedWinner { .. }) {
+    pub fn resolve_unbounded(&mut self, resolved_at_ms: i64) -> Result<bool> {
+        if matches!(self.state, MemoryState::ResolvedUnbounded { .. }) {
             return Ok(false);
         }
         let resolved_at_ms = self.require_monotonic_time(resolved_at_ms)?;
-        self.state = MemoryState::ResolvedWinner { resolved_at_ms };
+        self.state = MemoryState::ResolvedUnbounded { resolved_at_ms };
         Ok(true)
     }
 
     /// Resolution away from this token removes only future/current liquidity.
     /// Historical maxima stay frozen at the resolution watermark.
-    pub fn resolve_loser(&mut self, resolved_at_ms: i64) -> Result<bool> {
-        if matches!(self.state, MemoryState::ResolvedWinner { .. }) {
+    pub fn resolve_zero_future(&mut self, resolved_at_ms: i64) -> Result<bool> {
+        if matches!(self.state, MemoryState::ResolvedUnbounded { .. }) {
             return Ok(false);
         }
         self.replace_continuous(&[], resolved_at_ms)
@@ -269,7 +269,7 @@ impl PressureFrontierMemory {
 
     fn current_levels_map(&self) -> BTreeMap<u16, f64> {
         let runs = match &self.state {
-            MemoryState::Unobserved | MemoryState::ResolvedWinner { .. } => {
+            MemoryState::Unobserved | MemoryState::ResolvedUnbounded { .. } => {
                 return BTreeMap::new();
             }
             MemoryState::Observed { runs, .. } => runs,
@@ -287,18 +287,18 @@ impl PressureFrontierMemory {
             MemoryState::Observed {
                 valid_through_ms, ..
             } => Some(*valid_through_ms),
-            MemoryState::ResolvedWinner { resolved_at_ms } => Some(*resolved_at_ms),
+            MemoryState::ResolvedUnbounded { resolved_at_ms } => Some(*resolved_at_ms),
         }
     }
 
-    pub fn is_resolved_winner(&self) -> bool {
-        matches!(self.state, MemoryState::ResolvedWinner { .. })
+    pub fn is_resolved_unbounded(&self) -> bool {
+        matches!(self.state, MemoryState::ResolvedUnbounded { .. })
     }
 
     fn ensure_mutable(&self) -> Result<()> {
         ensure!(
-            !matches!(self.state, MemoryState::ResolvedWinner { .. }),
-            "resolved winner pressure is terminal"
+            !matches!(self.state, MemoryState::ResolvedUnbounded { .. }),
+            "resolved unbounded pressure is terminal"
         );
         Ok(())
     }
@@ -321,7 +321,7 @@ impl PressureFrontierMemory {
         match std::mem::replace(&mut self.state, MemoryState::Unobserved) {
             MemoryState::Unobserved => Vec::new(),
             MemoryState::Observed { runs, .. } => runs,
-            MemoryState::ResolvedWinner { .. } => {
+            MemoryState::ResolvedUnbounded { .. } => {
                 unreachable!("terminal pressure cannot expose mutable runs")
             }
         }
@@ -778,13 +778,13 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        memory.resolve_winner(2_000).unwrap();
+        memory.resolve_unbounded(2_000).unwrap();
 
-        assert!(memory.is_resolved_winner());
+        assert!(memory.is_resolved_unbounded());
         assert!(memory.current_levels().is_empty());
         assert_eq!(
             memory.snapshot().state,
-            SnapshotState::ResolvedWinner {
+            SnapshotState::ResolvedUnbounded {
                 resolved_at_ms: 2_000,
             }
         );
@@ -806,7 +806,7 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        memory.resolve_loser(2_000).unwrap();
+        memory.resolve_zero_future(2_000).unwrap();
 
         let SnapshotState::Observed {
             valid_through_ms,

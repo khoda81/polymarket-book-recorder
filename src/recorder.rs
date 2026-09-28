@@ -736,17 +736,35 @@ impl AgeRecorder {
                 }
                 MarketEvent::MarketResolved(event) => {
                     let market = event.market;
-                    let winner = event.winning_asset_id;
-                    let mut resolving = self
+                    let semantic_winner = event.winning_asset_id;
+                    let mut asset_ids = self
                         .markets
                         .iter()
                         .filter(|((market_id, _), _)| market_id == &market)
                         .flat_map(|(_, state)| state.token_ids.iter().cloned())
                         .collect::<BTreeSet<_>>();
-                    resolving.extend(event.assets_ids);
-                    resolving.insert(winner.clone());
-                    resolving.retain(|token_id| self.tokens.contains_key(token_id));
+                    asset_ids.extend(event.assets_ids);
+                    asset_ids.insert(semantic_winner.clone());
 
+                    let unbounded_source = if asset_ids.len() == 2 {
+                        asset_ids
+                            .iter()
+                            .find(|token_id| *token_id != &semantic_winner)
+                            .cloned()
+                    } else {
+                        None
+                    }
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cannot map resolved market {market} with {} asset ids onto a binary pressure pair",
+                            asset_ids.len()
+                        )
+                    })?;
+
+                    let resolving = asset_ids
+                        .into_iter()
+                        .filter(|token_id| self.tokens.contains_key(token_id))
+                        .collect::<BTreeSet<_>>();
                     let excluded = resolving.iter().cloned().collect::<HashSet<_>>();
                     let market_watermark = self
                         .observe_market_watermark(
@@ -761,7 +779,7 @@ impl AgeRecorder {
                     for token_id in resolving {
                         if self.complete_token(
                             &token_id,
-                            token_id == winner,
+                            token_id == unbounded_source,
                             market_watermark,
                         )? {
                             removed.push(token_id);
@@ -1022,7 +1040,7 @@ impl AgeRecorder {
     fn complete_token(
         &mut self,
         token_id: &str,
-        winner: bool,
+        unbounded: bool,
         resolved_at_ms: i64,
     ) -> Result<bool> {
         if !self.tokens.contains_key(token_id) {
@@ -1042,10 +1060,10 @@ impl AgeRecorder {
         let resolved_at_ms = memory
             .valid_through_ms()
             .map_or(resolved_at_ms, |current| current.max(resolved_at_ms));
-        if winner {
-            memory.resolve_winner(resolved_at_ms)?;
+        if unbounded {
+            memory.resolve_unbounded(resolved_at_ms)?;
         } else {
-            memory.resolve_loser(resolved_at_ms)?;
+            memory.resolve_zero_future(resolved_at_ms)?;
         }
 
         if state.recording_since_ms.is_none() {
