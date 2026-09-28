@@ -772,10 +772,7 @@ mod tests {
 
         assert!(memory.is_resolved_unbounded());
         assert!(memory.current_levels().is_empty());
-        assert_eq!(
-            memory.snapshot().state,
-            SnapshotState::ResolvedUnbounded
-        );
+        assert_eq!(memory.snapshot().state, SnapshotState::ResolvedUnbounded);
         assert_eq!(
             PressureFrontierMemory::restore(memory.snapshot()).unwrap(),
             memory

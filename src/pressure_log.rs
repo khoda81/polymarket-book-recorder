@@ -49,11 +49,9 @@ pub fn encode_pressure_mutation(mutation: &RecorderPressureMutation) -> Result<V
             valid_through_ms: Some(validate_timestamp(*valid_through_ms)?),
             changes: encode_levels(changes, true)?,
         }),
-        RecorderPressureMutation::Advance { valid_through_ms } => {
-            Kind::Advance(wire::Advance {
-                valid_through_ms: Some(validate_timestamp(*valid_through_ms)?),
-            })
-        }
+        RecorderPressureMutation::Advance { valid_through_ms } => Kind::Advance(wire::Advance {
+            valid_through_ms: Some(validate_timestamp(*valid_through_ms)?),
+        }),
         RecorderPressureMutation::ReplaceContinuous {
             valid_through_ms,
             levels,
@@ -149,7 +147,10 @@ fn required_timestamp(value: Option<i64>, field: &str) -> Result<i64> {
     validate_timestamp(value)
 }
 
-fn encode_levels(levels: &[PressureLevel], allow_zero_shares: bool) -> Result<Vec<wire::PressureLevel>> {
+fn encode_levels(
+    levels: &[PressureLevel],
+    allow_zero_shares: bool,
+) -> Result<Vec<wire::PressureLevel>> {
     levels
         .iter()
         .map(|level| {
