@@ -4,7 +4,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const PRICE_SCALE: u16 = 10_000;
-pub const SNAPSHOT_VERSION: u8 = 6;
+pub const SNAPSHOT_VERSION: u8 = 7;
+const LEGACY_SNAPSHOT_VERSION: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PressureLevel {
@@ -92,10 +93,11 @@ impl Default for PressureFrontierMemory {
 impl PressureFrontierMemory {
     pub fn restore(snapshot: PressureFrontierSnapshot) -> Result<Self> {
         ensure!(
-            snapshot.version == SNAPSHOT_VERSION,
+            snapshot.version == LEGACY_SNAPSHOT_VERSION || snapshot.version == SNAPSHOT_VERSION,
             "unsupported pressure frontier snapshot version: {}",
             snapshot.version
         );
+        let snapshot_version = snapshot.version;
 
         let state = match snapshot.state {
             SnapshotState::Unobserved => MemoryState::Unobserved,
@@ -110,6 +112,10 @@ impl PressureFrontierMemory {
                 }
             }
             SnapshotState::ResolvedUnbounded { resolved_at_ms } => {
+                ensure!(
+                    snapshot_version == SNAPSHOT_VERSION,
+                    "resolved-unbounded pressure requires snapshot version {SNAPSHOT_VERSION}"
+                );
                 ensure!(
                     resolved_at_ms >= 0,
                     "pressure unbounded resolution timestamp must be non-negative"
