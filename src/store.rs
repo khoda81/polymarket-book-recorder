@@ -521,11 +521,11 @@ mod tests {
     }
 
     #[test]
-    fn appends_v6_mutations_then_atomically_replaces_with_checkpoint() {
+    fn appends_protobuf_mutations_then_atomically_replaces_with_checkpoint() {
         let temp = tempdir().unwrap();
         let store = RecorderStore::open(temp.path().join("recorder.sqlite")).unwrap();
 
-        let mutation = RecorderPressureMutation::Update {
+        let mutation = RecorderPressureMutation::ApplyDelta {
             valid_through_ms: 2_000,
             changes: vec![PressureLevel {
                 price: 5_000,
