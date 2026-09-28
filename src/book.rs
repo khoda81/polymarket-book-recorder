@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
-use crate::pressure::{FrontierLevel, PRICE_SCALE, PressureLevelChange};
+use crate::pressure::{PressureLevel, PRICE_SCALE, PressureLevel};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RawBookLevel {
@@ -40,10 +40,10 @@ impl AskBook {
         Ok(())
     }
 
-    pub fn pressure_levels(&self) -> Vec<FrontierLevel> {
+    pub fn pressure_levels(&self) -> Vec<PressureLevel> {
         self.levels
             .iter()
-            .map(|(&key, &weight)| FrontierLevel { key, weight })
+            .map(|(&price, &shares)| PressureLevel { price, shares })
             .collect()
     }
 
@@ -52,7 +52,7 @@ impl AskBook {
         side: &str,
         price: &str,
         size: &str,
-    ) -> Result<Option<PressureLevelChange>> {
+    ) -> Result<Option<PressureLevel>> {
         match side {
             // Bids belong to the reverse token edge. They still matter as an
             // observation timestamp to PressureFrontierMemory, but there is no
@@ -62,7 +62,7 @@ impl AskBook {
                 let price = parse_price(price)?;
                 let shares = parse_shares(size)?;
                 self.set_level(price, shares)?;
-                Ok(Some(PressureLevelChange { price, shares }))
+                Ok(Some(PressureLevel { price, shares }))
             }
             other => bail!("unsupported order side: {other}"),
         }
@@ -142,16 +142,16 @@ mod tests {
 
         assert_eq!(
             book.apply_change("SELL", "0.5", "12").unwrap(),
-            Some(PressureLevelChange {
+            Some(PressureLevel {
                 price: 5_000,
                 shares: 12.0,
             })
         );
         assert_eq!(
             book.pressure_levels(),
-            vec![FrontierLevel {
-                key: 5_000,
-                weight: 12.0,
+            vec![PressureLevel {
+                price: 5_000,
+                shares: 12.0,
             }]
         );
 
