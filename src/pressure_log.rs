@@ -151,33 +151,50 @@ fn encode_levels(
     levels: &[PressureLevel],
     allow_zero_shares: bool,
 ) -> Result<Vec<wire::PressureLevel>> {
-    levels
+    validate_canonical_levels(levels, allow_zero_shares)?;
+    Ok(levels
         .iter()
-        .map(|level| {
-            validate_level(level.price, level.shares, allow_zero_shares)?;
-            Ok(wire::PressureLevel {
-                price: u32::from(level.price),
-                shares: level.shares,
-            })
+        .map(|level| wire::PressureLevel {
+            price: u32::from(level.price),
+            shares: level.shares,
         })
-        .collect()
+        .collect())
 }
 
 fn decode_levels(
     levels: Vec<wire::PressureLevel>,
     allow_zero_shares: bool,
 ) -> Result<Vec<PressureLevel>> {
-    levels
+    let levels = levels
         .into_iter()
         .map(|level| {
             let price = u16::try_from(level.price).context("pressure price does not fit u16")?;
-            validate_level(price, level.shares, allow_zero_shares)?;
             Ok(PressureLevel {
                 price,
                 shares: level.shares,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    validate_canonical_levels(&levels, allow_zero_shares)?;
+    Ok(levels)
+}
+
+fn validate_canonical_levels(
+    levels: &[PressureLevel],
+    allow_zero_shares: bool,
+) -> Result<()> {
+    let mut previous_price = None;
+    for level in levels {
+        validate_level(level.price, level.shares, allow_zero_shares)?;
+        if let Some(previous_price) = previous_price {
+            ensure!(
+                level.price > previous_price,
+                "pressure mutation prices must be strictly increasing"
+            );
+        }
+        previous_price = Some(level.price);
+    }
+    Ok(())
 }
 
 fn validate_level(price: u16, shares: f64, allow_zero_shares: bool) -> Result<()> {
@@ -238,6 +255,24 @@ mod tests {
         .encode_to_vec();
 
         assert!(decode_pressure_mutation(&encoded).is_err());
+    }
+
+    #[test]
+    fn noncanonical_level_order_is_rejected() {
+        let mutation = RecorderPressureMutation::ApplyDelta {
+            valid_through_ms: 1,
+            changes: vec![
+                PressureLevel {
+                    price: 5_000,
+                    shares: 1.0,
+                },
+                PressureLevel {
+                    price: 4_000,
+                    shares: 2.0,
+                },
+            ],
+        };
+        assert!(encode_pressure_mutation(&mutation).is_err());
     }
 
     #[test]

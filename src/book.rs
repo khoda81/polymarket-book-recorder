@@ -43,6 +43,7 @@ impl AskBook {
     pub fn pressure_levels(&self) -> Vec<PressureLevel> {
         self.levels
             .iter()
+            .filter(|(price, _)| **price > 0)
             .map(|(&price, &shares)| PressureLevel { price, shares })
             .collect()
     }
@@ -62,7 +63,7 @@ impl AskBook {
                 let price = parse_price(price)?;
                 let shares = parse_shares(size)?;
                 self.set_level(price, shares)?;
-                Ok(Some(PressureLevel { price, shares }))
+                Ok((price > 0).then_some(PressureLevel { price, shares }))
             }
             other => bail!("unsupported order side: {other}"),
         }
