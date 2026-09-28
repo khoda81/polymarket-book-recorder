@@ -761,7 +761,7 @@ impl AgeRecorder {
                     )?;
 
                     let Some(semantic_winner) = event.winning_asset_id else {
-                        continue;
+                        return Ok(());
                     };
                     let unbounded_source = if asset_ids.len() == 2 {
                         asset_ids

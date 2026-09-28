@@ -149,14 +149,6 @@ where
         .map_err(de::Error::custom)
 }
 
-fn deserialize_epoch_ms<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    parse_epoch_ms(value).map_err(de::Error::custom)
-}
-
 fn parse_epoch_ms(value: Value) -> std::result::Result<i64, String> {
     let timestamp = match value {
         Value::String(value) => value
