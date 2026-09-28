@@ -319,7 +319,7 @@ impl RecorderRuntime {
     }
 }
 
-pub async fn start(store: Arc<RecorderStore>, mut fees: FeeResolver) -> Result<RecorderRuntime> {
+pub async fn start(store: Arc<RecorderStore>, fees: FeeResolver) -> Result<RecorderRuntime> {
     let index = store.load_index()?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (subscription_tx, subscription_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -719,6 +719,7 @@ impl AgeRecorder {
                     )?;
 
                     for (token_id, changes) in by_token {
+                        let fee = self.market_fee(&market, &token_id)?;
                         let pressure_changes = {
                             let Some(TokenState::Watched(state)) = self.tokens.get_mut(&token_id)
                             else {
@@ -729,7 +730,6 @@ impl AgeRecorder {
                                 // observation and supersedes any pre-snapshot deltas.
                                 continue;
                             };
-                            let fee = self.market_fee(&market, &token_id)?;
                             apply_book_changes(book, &changes, fee)?
                         };
 
