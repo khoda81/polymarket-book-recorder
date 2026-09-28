@@ -36,7 +36,7 @@ enum SnapshotState {
     },
     ResolvedUnbounded {
         #[serde(rename = "resolvedAtMs")]
-        resolved_at_ms: i64,
+        resolved_at_ms: Option<i64>,
     },
 }
 
@@ -73,7 +73,7 @@ enum MemoryState {
         runs: Vec<PressureRun>,
     },
     ResolvedUnbounded {
-        resolved_at_ms: i64,
+        resolved_at_ms: Option<i64>,
     },
 }
 
@@ -116,10 +116,12 @@ impl PressureFrontierMemory {
                     snapshot_version == SNAPSHOT_VERSION,
                     "resolved-unbounded pressure requires snapshot version {SNAPSHOT_VERSION}"
                 );
-                ensure!(
-                    resolved_at_ms >= 0,
-                    "pressure unbounded resolution timestamp must be non-negative"
-                );
+                if let Some(resolved_at_ms) = resolved_at_ms {
+                    ensure!(
+                        resolved_at_ms >= 0,
+                        "pressure unbounded resolution timestamp must be non-negative"
+                    );
+                }
                 MemoryState::ResolvedUnbounded { resolved_at_ms }
             }
         };
@@ -247,23 +249,51 @@ impl PressureFrontierMemory {
         Ok(previous_time != Some(valid_through_ms))
     }
 
-    /// Resolution to this token dominates every finite historical offer.
-    pub fn resolve_unbounded(&mut self, resolved_at_ms: i64) -> Result<bool> {
-        if matches!(self.state, MemoryState::ResolvedUnbounded { .. }) {
-            return Ok(false);
+    /// Terminal unbounded pressure dominates every finite historical offer.
+    pub fn resolve_unbounded(&mut self, resolved_at_ms: Option<i64>) -> Result<bool> {
+        if let Some(resolved_at_ms) = resolved_at_ms {
+            self.require_monotonic_time(resolved_at_ms)?;
         }
-        let resolved_at_ms = self.require_monotonic_time(resolved_at_ms)?;
+
+        if let MemoryState::ResolvedUnbounded {
+            resolved_at_ms: previous,
+        } = self.state
+        {
+            let next = match (previous, resolved_at_ms) {
+                (Some(previous), Some(next)) => Some(previous.max(next)),
+                (Some(previous), None) => Some(previous),
+                (None, next) => next,
+            };
+            let changed = next != previous;
+            self.state = MemoryState::ResolvedUnbounded {
+                resolved_at_ms: next,
+            };
+            return Ok(changed);
+        }
+
         self.state = MemoryState::ResolvedUnbounded { resolved_at_ms };
         Ok(true)
     }
 
-    /// Resolution away from this token removes only future/current liquidity.
-    /// Historical maxima stay frozen at the resolution watermark.
-    pub fn resolve_zero_future(&mut self, resolved_at_ms: i64) -> Result<bool> {
+    /// Resolution away from this semantic token removes only future/current
+    /// liquidity. With no resolution timestamp, freeze only through the latest
+    /// watermark already proven.
+    pub fn resolve_zero_future(&mut self, resolved_at_ms: Option<i64>) -> Result<bool> {
         if matches!(self.state, MemoryState::ResolvedUnbounded { .. }) {
             return Ok(false);
         }
-        self.replace_continuous(&[], resolved_at_ms)
+
+        let watermark = match (self.valid_through_ms(), resolved_at_ms) {
+            (Some(current), Some(resolved)) => Some(current.max(resolved)),
+            (Some(current), None) => Some(current),
+            (None, Some(resolved)) => Some(resolved),
+            (None, None) => None,
+        };
+
+        match watermark {
+            Some(watermark) => self.replace_continuous(&[], watermark),
+            None => Ok(false),
+        }
     }
 
     pub fn current_levels(&self) -> Vec<PressureLevel> {
@@ -293,7 +323,7 @@ impl PressureFrontierMemory {
             MemoryState::Observed {
                 valid_through_ms, ..
             } => Some(*valid_through_ms),
-            MemoryState::ResolvedUnbounded { resolved_at_ms } => Some(*resolved_at_ms),
+            MemoryState::ResolvedUnbounded { resolved_at_ms } => *resolved_at_ms,
         }
     }
 
@@ -784,14 +814,14 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        memory.resolve_unbounded(2_000).unwrap();
+        memory.resolve_unbounded(Some(2_000)).unwrap();
 
         assert!(memory.is_resolved_unbounded());
         assert!(memory.current_levels().is_empty());
         assert_eq!(
             memory.snapshot().state,
             SnapshotState::ResolvedUnbounded {
-                resolved_at_ms: 2_000,
+                resolved_at_ms: Some(2_000),
             }
         );
         assert_eq!(
@@ -812,7 +842,7 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        memory.resolve_zero_future(2_000).unwrap();
+        memory.resolve_zero_future(Some(2_000)).unwrap();
 
         let SnapshotState::Observed {
             valid_through_ms,

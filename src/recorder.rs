@@ -736,7 +736,6 @@ impl AgeRecorder {
                 }
                 MarketEvent::MarketResolved(event) => {
                     let market = event.market;
-                    let semantic_winner = event.winning_asset_id;
                     let mut asset_ids = self
                         .markets
                         .iter()
@@ -744,8 +743,26 @@ impl AgeRecorder {
                         .flat_map(|(_, state)| state.token_ids.iter().cloned())
                         .collect::<BTreeSet<_>>();
                     asset_ids.extend(event.assets_ids);
-                    asset_ids.insert(semantic_winner.clone());
+                    if let Some(semantic_winner) = &event.winning_asset_id {
+                        asset_ids.insert(semantic_winner.clone());
+                    }
 
+                    let resolving = asset_ids
+                        .iter()
+                        .filter(|token_id| self.tokens.contains_key(*token_id))
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let excluded = resolving.iter().cloned().collect::<HashSet<_>>();
+                    let market_watermark = self.observe_market_watermark(
+                        &market,
+                        shard_id,
+                        event.timestamp_ms,
+                        &excluded,
+                    )?;
+
+                    let Some(semantic_winner) = event.winning_asset_id else {
+                        continue;
+                    };
                     let unbounded_source = if asset_ids.len() == 2 {
                         asset_ids
                             .iter()
@@ -760,20 +777,6 @@ impl AgeRecorder {
                             asset_ids.len()
                         )
                     })?;
-
-                    let resolving = asset_ids
-                        .into_iter()
-                        .filter(|token_id| self.tokens.contains_key(token_id))
-                        .collect::<BTreeSet<_>>();
-                    let excluded = resolving.iter().cloned().collect::<HashSet<_>>();
-                    let market_watermark = self
-                        .observe_market_watermark(
-                            &market,
-                            shard_id,
-                            Some(event.timestamp_ms),
-                            &excluded,
-                        )?
-                        .expect("resolution timestamp always produces a market watermark");
 
                     let mut removed = Vec::new();
                     for token_id in resolving {
@@ -1041,7 +1044,7 @@ impl AgeRecorder {
         &mut self,
         token_id: &str,
         unbounded: bool,
-        resolved_at_ms: i64,
+        resolved_at_ms: Option<i64>,
     ) -> Result<bool> {
         if !self.tokens.contains_key(token_id) {
             return Ok(false);
@@ -1057,9 +1060,11 @@ impl AgeRecorder {
         };
 
         let memory = state.pressure.memory_or_default()?;
-        let resolved_at_ms = memory
-            .valid_through_ms()
-            .map_or(resolved_at_ms, |current| current.max(resolved_at_ms));
+        let resolved_at_ms = match (memory.valid_through_ms(), resolved_at_ms) {
+            (Some(current), Some(resolved)) => Some(current.max(resolved)),
+            (Some(current), None) => Some(current),
+            (None, resolved) => resolved,
+        };
         if unbounded {
             memory.resolve_unbounded(resolved_at_ms)?;
         } else {
@@ -1067,7 +1072,7 @@ impl AgeRecorder {
         }
 
         if state.recording_since_ms.is_none() {
-            state.recording_since_ms = Some(resolved_at_ms);
+            state.recording_since_ms = resolved_at_ms;
         }
 
         self.tokens.insert(
