@@ -968,7 +968,7 @@ impl AgeRecorder {
 
         state
             .pending_pressure_mutations_mut()
-            .push(RecorderPressureMutation::Replace {
+            .push(RecorderPressureMutation::ObserveSnapshot {
                 valid_through_ms,
                 levels,
             });
@@ -1028,7 +1028,7 @@ impl AgeRecorder {
 
         state
             .pending_pressure_mutations_mut()
-            .push(RecorderPressureMutation::Update {
+            .push(RecorderPressureMutation::ApplyDelta {
                 valid_through_ms,
                 changes,
             });
@@ -1067,7 +1067,7 @@ impl AgeRecorder {
         };
 
         if unbounded {
-            memory.resolve_unbounded(pressure_resolved_at_ms)?;
+            memory.resolve_unbounded();
         } else {
             memory.resolve_zero_future(pressure_resolved_at_ms)?;
         }
