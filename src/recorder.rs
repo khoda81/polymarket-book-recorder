@@ -363,7 +363,9 @@ pub async fn start(
                     .fees
                     .resolve_token(token_id)
                     .await
-                    .with_context(|| format!("resolving fee metadata for watched token {token_id}"))?;
+                    .with_context(|| {
+                        format!("resolving fee metadata for watched token {token_id}")
+                    })?;
                 recorder.store.save_market_fee(&market)?;
             }
             recorder
@@ -681,14 +683,14 @@ impl AgeRecorder {
                     self.subscription_ingress_bytes =
                         self.subscription_ingress_bytes.saturating_add(bytes as u64);
 
-                    let exhausted_now =
-                        if let Some(remaining) = self.subscription_budget_remaining.get_mut(&token_id)
-                        {
-                            *remaining = remaining.saturating_sub(bytes);
-                            *remaining == 0
-                        } else {
-                            false
-                        };
+                    let exhausted_now = if let Some(remaining) =
+                        self.subscription_budget_remaining.get_mut(&token_id)
+                    {
+                        *remaining = remaining.saturating_sub(bytes);
+                        *remaining == 0
+                    } else {
+                        false
+                    };
 
                     if exhausted_now {
                         exhausted.push(token_id);
