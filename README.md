@@ -7,8 +7,13 @@ Older database schemas are rejected.
 
 ## Features
 
-- Polymarket market WebSocket subscriptions, heartbeat, reconnect, and
-  continuity invalidation
+- demand-driven Polymarket market WebSocket subscriptions, heartbeat,
+  reconnect, and continuity invalidation
+- persisted watched tokens stay dormant after restart by default; use
+  `--resume-watched` to resume all of them explicitly
+- each requested token gets a 1 MiB upstream WebSocket payload lease; another
+  state/watch request refreshes it, while exhaustion unsubscribes the token
+  without deleting its persisted history
 - WebSocket-only causal book bootstrap; REST snapshots are never merged into
   an in-flight market stream
 - market-local, stream-local watermark propagation from ordered market events
@@ -40,6 +45,7 @@ shared locks.
 ## Run
 
 By default the service uses `.data/rust-recorder.sqlite` and port `3001`.
+Persisted watched tokens are loaded but are not re-subscribed until requested.
 
 Run a release build with:
 
@@ -48,6 +54,11 @@ Run a release build with:
 Or choose them explicitly:
 
     cargo run --release -- --database .data/rust-recorder.sqlite --port 3002
+
+To restore the old continuous-recording startup behavior and immediately
+re-subscribe every persisted watched token:
+
+    cargo run --release -- --resume-watched
 
 See all CLI options with:
 
