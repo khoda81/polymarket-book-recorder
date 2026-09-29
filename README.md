@@ -35,6 +35,8 @@ Older database schemas are rejected.
 - incremental writeback with a checkpoint every 512 mutations
 - `GET /api/recorder/health`
 - `GET /api/recorder/state`
+- `GET /api/recorder/traffic?limit=100` for runtime per-token WebSocket ingress,
+  sorted from highest to lowest traffic
 - `POST /api/recorder/watch`
 - graceful SIGINT/SIGTERM flush
 
