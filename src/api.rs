@@ -9,7 +9,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::recorder::{RecorderHandle, RecorderStats};
+use crate::recorder::{RecorderHandle, RecorderStats, RecorderTraffic};
 
 #[derive(Clone)]
 struct AppState {
@@ -44,6 +44,7 @@ pub fn router(recorder: RecorderHandle) -> Router {
     Router::new()
         .route("/api/recorder/health", get(health))
         .route("/api/recorder/state", get(state))
+        .route("/api/recorder/traffic", get(traffic))
         .route("/api/recorder/watch", post(watch))
         .layer(cors)
         .with_state(AppState { recorder })
@@ -51,6 +52,14 @@ pub fn router(recorder: RecorderHandle) -> Router {
 
 async fn health(State(state): State<AppState>) -> Result<Json<RecorderStats>, ApiError> {
     Ok(Json(state.recorder.stats().await?))
+}
+
+async fn traffic(
+    State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<RecorderTraffic>, ApiError> {
+    let limit = TrafficQuery::parse(raw_query.as_deref()).limit;
+    Ok(Json(state.recorder.traffic(limit).await?))
 }
 
 async fn state(
@@ -94,6 +103,24 @@ async fn watch(
 ) -> Result<Json<WatchResponse>, ApiError> {
     let (changed, stats) = state.recorder.watch(body.token_ids).await?;
     Ok(Json(WatchResponse { changed, stats }))
+}
+
+#[derive(Debug)]
+struct TrafficQuery {
+    limit: usize,
+}
+
+impl TrafficQuery {
+    fn parse(raw: Option<&str>) -> Self {
+        let limit = url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes())
+            .find_map(|(key, value)| {
+                (key == "limit")
+                    .then(|| value.parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(100);
+        Self { limit }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -159,7 +186,14 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::StateQuery;
+    use super::{StateQuery, TrafficQuery};
+
+    #[test]
+    fn traffic_query_parses_limit() {
+        assert_eq!(TrafficQuery::parse(Some("limit=25")).limit, 25);
+        assert_eq!(TrafficQuery::parse(None).limit, 100);
+        assert_eq!(TrafficQuery::parse(Some("limit=nope")).limit, 100);
+    }
 
     #[test]
     fn state_query_accepts_repeated_and_comma_separated_tokens() {

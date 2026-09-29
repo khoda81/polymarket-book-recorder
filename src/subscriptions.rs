@@ -37,6 +37,12 @@ pub enum SubscriptionEvent {
         /// This send time is a causal lower bound on snapshot generation.
         snapshot_requested_at_ms: Option<i64>,
     },
+    /// Text-frame payload bytes attributed evenly across the token ids carried
+    /// by that frame. This intentionally measures upstream payload, not SQLite
+    /// write size.
+    Ingress {
+        bytes_by_token: Vec<(String, usize)>,
+    },
     ContinuityLost {
         shard_id: u64,
         token_ids: Vec<String>,
@@ -94,6 +100,14 @@ impl SubscriptionPool {
 
     pub fn assigned_token_count(&self) -> usize {
         self.owner_by_token.len()
+    }
+
+    pub fn is_assigned(&self, token_id: &str) -> bool {
+        self.owner_by_token.contains_key(token_id)
+    }
+
+    pub fn is_owned_by(&self, shard_id: u64, token_id: &str) -> bool {
+        self.owner_by_token.get(token_id) == Some(&shard_id)
     }
 
     pub async fn add(&mut self, token_ids: impl IntoIterator<Item = String>) {
@@ -396,6 +410,8 @@ async fn run_shard(
                                 }
                             };
 
+                            let bytes_by_token = attribute_frame_bytes(text.len(), &events);
+
                             for event in events {
                                 let snapshot_requested_at_ms = match &event {
                                     MarketEvent::Book(book) => {
@@ -414,6 +430,15 @@ async fn run_shard(
                                 {
                                     break 'lifetime;
                                 }
+                            }
+
+                            if !bytes_by_token.is_empty()
+                                && event_tx
+                                    .send(SubscriptionEvent::Ingress { bytes_by_token })
+                                    .await
+                                    .is_err()
+                            {
+                                break 'lifetime;
                             }
                         }
                         Message::Ping(payload) => {
@@ -449,6 +474,52 @@ async fn run_shard(
     }
 
     debug!(shard_id, "Polymarket websocket shard stopped");
+}
+
+fn attribute_frame_bytes(frame_bytes: usize, events: &[MarketEvent]) -> Vec<(String, usize)> {
+    let mut token_ids = BTreeSet::new();
+
+    for event in events {
+        match event {
+            MarketEvent::Book(event) => {
+                token_ids.insert(event.asset_id.clone());
+            }
+            MarketEvent::PriceChange(event) => {
+                token_ids.extend(
+                    event
+                        .price_changes
+                        .iter()
+                        .map(|change| change.asset_id.clone()),
+                );
+            }
+            MarketEvent::Watermark(event) => {
+                if let Some(token_id) = &event.asset_id {
+                    token_ids.insert(token_id.clone());
+                }
+            }
+            MarketEvent::MarketResolved(event) => {
+                if let Some(asset_ids) = &event.assets_ids {
+                    token_ids.extend(asset_ids.iter().cloned());
+                }
+                if let Some(token_id) = &event.winning_asset_id {
+                    token_ids.insert(token_id.clone());
+                }
+            }
+        }
+    }
+
+    if token_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let count = token_ids.len();
+    let base = frame_bytes / count;
+    let remainder = frame_bytes % count;
+    token_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, token_id)| (token_id, base + usize::from(index < remainder)))
+        .collect()
 }
 
 fn drain_commands_while_disconnected(
@@ -505,6 +576,39 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_bytes_are_attributed_once_across_unique_tokens() {
+        let events = parse_market_message(
+            r#"[{"event_type":"book","market":"m","asset_id":"a","asks":[],"timestamp":"1"},{"event_type":"price_change","market":"m","price_changes":[{"asset_id":"a","price":"0.5","size":"1","side":"SELL"},{"asset_id":"b","price":"0.6","size":"2","side":"SELL"}],"timestamp":"2"}]"#,
+        )
+        .unwrap();
+
+        let attributed = attribute_frame_bytes(101, &events);
+        assert_eq!(
+            attributed.iter().map(|(_, bytes)| bytes).sum::<usize>(),
+            101
+        );
+        assert_eq!(
+            attributed
+                .iter()
+                .map(|(token_id, _)| token_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn ownership_is_shard_specific() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let mut pool = SubscriptionPool::with_url("ws://invalid", event_tx);
+        pool.owner_by_token.insert("token".into(), 7);
+
+        assert!(pool.is_assigned("token"));
+        assert!(pool.is_owned_by(7, "token"));
+        assert!(!pool.is_owned_by(8, "token"));
+        assert!(!pool.is_owned_by(7, "other"));
+    }
 
     #[test]
     fn take_first_is_deterministic() {

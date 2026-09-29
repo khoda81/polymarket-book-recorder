@@ -28,6 +28,7 @@ use crate::{
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(1);
 const EVENT_CHANNEL_CAPACITY: usize = 16_384;
 const COMMAND_CHANNEL_CAPACITY: usize = 128;
+const TOKEN_INGRESS_BUDGET_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TransportState {
@@ -44,6 +45,22 @@ pub struct RecorderStateResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TokenTraffic {
+    pub token_id: String,
+    pub bytes: u64,
+    pub active: bool,
+    pub budget_remaining_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecorderTraffic {
+    pub total_bytes: u64,
+    pub tokens: Vec<TokenTraffic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecorderStats {
     pub watched_tokens: usize,
     pub completed_tokens: usize,
@@ -52,6 +69,9 @@ pub struct RecorderStats {
     pub subscription_connections: usize,
     pub connected_subscription_connections: usize,
     pub assigned_subscription_tokens: usize,
+    pub budgeted_subscription_tokens: usize,
+    pub subscription_ingress_bytes: u64,
+    pub budget_exhausted_tokens: u64,
     pub dirty_tokens: usize,
     pub pending_pressure_mutations: usize,
     pub oldest_recording_since_ms: Option<i64>,
@@ -236,6 +256,10 @@ enum RecorderCommand {
     Stats {
         reply: oneshot::Sender<std::result::Result<RecorderStats, String>>,
     },
+    Traffic {
+        limit: usize,
+        reply: oneshot::Sender<RecorderTraffic>,
+    },
     Stop {
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
@@ -290,6 +314,15 @@ impl RecorderHandle {
             .map_err(|_| anyhow!("recorder stopped"))?
             .map_err(anyhow::Error::msg)
     }
+
+    pub async fn traffic(&self, limit: usize) -> Result<RecorderTraffic> {
+        let (reply, response) = oneshot::channel();
+        self.command_tx
+            .send(RecorderCommand::Traffic { limit, reply })
+            .await
+            .map_err(|_| anyhow!("recorder stopped"))?;
+        response.await.map_err(|_| anyhow!("recorder stopped"))
+    }
 }
 
 pub struct RecorderRuntime {
@@ -319,7 +352,11 @@ impl RecorderRuntime {
     }
 }
 
-pub async fn start(store: Arc<RecorderStore>, fees: FeeResolver) -> Result<RecorderRuntime> {
+pub async fn start(
+    store: Arc<RecorderStore>,
+    fees: FeeResolver,
+    resume_watched: bool,
+) -> Result<RecorderRuntime> {
     let index = store.load_index()?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (subscription_tx, subscription_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -343,22 +380,29 @@ pub async fn start(store: Arc<RecorderStore>, fees: FeeResolver) -> Result<Recor
         );
     }
 
-    let watched = recorder
-        .tokens
-        .iter()
-        .filter_map(|(token_id, state)| state.is_watched().then_some(token_id.clone()))
-        .collect::<Vec<_>>();
-    for token_id in &watched {
-        if recorder.fees.cached_for_token(token_id).is_none() {
-            let market = recorder
-                .fees
-                .resolve_token(token_id)
-                .await
-                .with_context(|| format!("resolving fee metadata for watched token {token_id}"))?;
-            recorder.store.save_market_fee(&market)?;
+    if resume_watched {
+        let watched = recorder
+            .tokens
+            .iter()
+            .filter_map(|(token_id, state)| state.is_watched().then_some(token_id.clone()))
+            .collect::<Vec<_>>();
+        for token_id in &watched {
+            if recorder.fees.cached_for_token(token_id).is_none() {
+                let market = recorder
+                    .fees
+                    .resolve_token(token_id)
+                    .await
+                    .with_context(|| {
+                        format!("resolving fee metadata for watched token {token_id}")
+                    })?;
+                recorder.store.save_market_fee(&market)?;
+            }
+            recorder
+                .subscription_budget_remaining
+                .insert(token_id.clone(), TOKEN_INGRESS_BUDGET_BYTES);
         }
+        recorder.subscriptions.add(watched).await;
     }
-    recorder.subscriptions.add(watched).await;
 
     let task = tokio::spawn(recorder.run());
     Ok(RecorderRuntime {
@@ -374,6 +418,10 @@ struct AgeRecorder {
     tokens: HashMap<String, TokenState>,
     markets: HashMap<(String, u64), MarketState>,
     dirty: BTreeSet<String>,
+    subscription_budget_remaining: HashMap<String, usize>,
+    subscription_ingress_by_token: HashMap<String, u64>,
+    subscription_ingress_bytes: u64,
+    budget_exhausted_tokens: u64,
     command_rx: mpsc::Receiver<RecorderCommand>,
     subscription_rx: mpsc::Receiver<SubscriptionEvent>,
 }
@@ -393,6 +441,10 @@ impl AgeRecorder {
             tokens: HashMap::new(),
             markets: HashMap::new(),
             dirty: BTreeSet::new(),
+            subscription_budget_remaining: HashMap::new(),
+            subscription_ingress_by_token: HashMap::new(),
+            subscription_ingress_bytes: 0,
+            budget_exhausted_tokens: 0,
             command_rx,
             subscription_rx,
         }
@@ -456,6 +508,9 @@ impl AgeRecorder {
             RecorderCommand::Stats { reply } => {
                 let _ = reply.send(self.stats().map_err(|error| error.to_string()));
             }
+            RecorderCommand::Traffic { limit, reply } => {
+                let _ = reply.send(self.traffic(limit));
+            }
             RecorderCommand::Stop { reply } => {
                 let result = self.shutdown().await;
                 let response = result.as_ref().map(|_| ()).map_err(ToString::to_string);
@@ -468,27 +523,45 @@ impl AgeRecorder {
     }
 
     async fn watch(&mut self, token_ids: Vec<String>) -> Result<bool> {
-        let pending = token_ids
+        let requested = token_ids
             .into_iter()
-            .filter(|token_id| !token_id.is_empty() && !self.tokens.contains_key(token_id))
+            .filter(|token_id| !token_id.is_empty())
             .collect::<BTreeSet<_>>();
 
-        if pending.is_empty() {
+        if requested.is_empty() {
             return Ok(false);
         }
 
+        let added = requested
+            .iter()
+            .filter(|token_id| !self.tokens.contains_key(*token_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let subscription_tokens = requested
+            .iter()
+            .filter(|token_id| {
+                self.tokens
+                    .get(*token_id)
+                    .is_none_or(TokenState::is_watched)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
         // Fee metadata is part of the book snapshot barrier. Resolve it before
         // subscribing so no raw-price snapshot can ever enter pressure state.
-        for token_id in &pending {
-            let market = self
-                .fees
-                .resolve_token(token_id)
-                .await
-                .with_context(|| format!("resolving fee metadata for token {token_id}"))?;
-            self.store.save_market_fee(&market)?;
+        // This also covers persisted watched tokens that were intentionally not
+        // resumed on process startup.
+        for token_id in &subscription_tokens {
+            if self.fees.cached_for_token(token_id).is_none() {
+                let market = self
+                    .fees
+                    .resolve_token(token_id)
+                    .await
+                    .with_context(|| format!("resolving fee metadata for token {token_id}"))?;
+                self.store.save_market_fee(&market)?;
+            }
         }
 
-        let added = pending.into_iter().collect::<Vec<_>>();
         for token_id in &added {
             self.tokens.insert(
                 token_id.clone(),
@@ -497,14 +570,31 @@ impl AgeRecorder {
             self.dirty.insert(token_id.clone());
         }
 
-        let watched = self
-            .tokens
-            .values()
-            .filter(|state| state.is_watched())
+        let newly_subscribed = subscription_tokens
+            .iter()
+            .filter(|token_id| !self.subscriptions.is_assigned(token_id))
             .count();
-        info!(tokens = added.len(), watched, "watching tokens");
-        self.subscriptions.add(added).await;
-        Ok(true)
+        for token_id in &subscription_tokens {
+            self.subscription_budget_remaining
+                .insert(token_id.clone(), TOKEN_INGRESS_BUDGET_BYTES);
+        }
+        self.subscriptions.add(subscription_tokens).await;
+
+        if !added.is_empty() || newly_subscribed > 0 {
+            let watched = self
+                .tokens
+                .values()
+                .filter(|state| state.is_watched())
+                .count();
+            info!(
+                added = added.len(),
+                subscribed = newly_subscribed,
+                watched,
+                "activated token subscription leases"
+            );
+        }
+
+        Ok(!added.is_empty() || newly_subscribed > 0)
     }
 
     async fn state(
@@ -601,6 +691,9 @@ impl AgeRecorder {
             subscription_connections: self.subscriptions.active_connection_count(),
             connected_subscription_connections: self.subscriptions.connected_connection_count(),
             assigned_subscription_tokens: self.subscriptions.assigned_token_count(),
+            budgeted_subscription_tokens: self.subscription_budget_remaining.len(),
+            subscription_ingress_bytes: self.subscription_ingress_bytes,
+            budget_exhausted_tokens: self.budget_exhausted_tokens,
             dirty_tokens: self.dirty.len(),
             pending_pressure_mutations: self
                 .tokens
@@ -615,8 +708,78 @@ impl AgeRecorder {
         })
     }
 
+    fn traffic(&self, limit: usize) -> RecorderTraffic {
+        let mut tokens = self
+            .subscription_ingress_by_token
+            .iter()
+            .map(|(token_id, &bytes)| TokenTraffic {
+                token_id: token_id.clone(),
+                bytes,
+                active: self.subscriptions.is_assigned(token_id),
+                budget_remaining_bytes: self.subscription_budget_remaining.get(token_id).copied(),
+            })
+            .collect::<Vec<_>>();
+        tokens.sort_unstable_by(|left, right| {
+            right
+                .bytes
+                .cmp(&left.bytes)
+                .then_with(|| left.token_id.cmp(&right.token_id))
+        });
+        tokens.truncate(limit);
+
+        RecorderTraffic {
+            total_bytes: self.subscription_ingress_bytes,
+            tokens,
+        }
+    }
+
     async fn consume_subscription_event(&mut self, event: SubscriptionEvent) -> Result<()> {
         match event {
+            SubscriptionEvent::Ingress { bytes_by_token } => {
+                let mut exhausted = Vec::new();
+
+                for (token_id, bytes) in bytes_by_token {
+                    let bytes = bytes as u64;
+                    self.subscription_ingress_bytes =
+                        self.subscription_ingress_bytes.saturating_add(bytes);
+                    let token_bytes = self
+                        .subscription_ingress_by_token
+                        .entry(token_id.clone())
+                        .or_default();
+                    *token_bytes = token_bytes.saturating_add(bytes);
+
+                    let exhausted_now = if let Some(remaining) =
+                        self.subscription_budget_remaining.get_mut(&token_id)
+                    {
+                        *remaining = remaining.saturating_sub(bytes as usize);
+                        *remaining == 0
+                    } else {
+                        false
+                    };
+
+                    if exhausted_now {
+                        exhausted.push(token_id);
+                    }
+                }
+
+                if !exhausted.is_empty() {
+                    for token_id in &exhausted {
+                        self.subscription_budget_remaining.remove(token_id);
+                        if let Some(TokenState::Watched(state)) = self.tokens.get_mut(token_id) {
+                            state.book = BookState::Unhydrated;
+                        }
+                    }
+                    self.budget_exhausted_tokens = self
+                        .budget_exhausted_tokens
+                        .saturating_add(exhausted.len() as u64);
+                    self.subscriptions.remove(exhausted.clone()).await;
+                    debug!(
+                        tokens = exhausted.len(),
+                        budget_bytes = TOKEN_INGRESS_BUDGET_BYTES,
+                        "subscription ingress budget exhausted"
+                    );
+                }
+            }
             SubscriptionEvent::ContinuityLost {
                 shard_id,
                 token_ids,
@@ -644,10 +807,11 @@ impl AgeRecorder {
             } => match event {
                 MarketEvent::Book(event) => {
                     let token_id = event.asset_id;
-                    if !self
-                        .tokens
-                        .get(&token_id)
-                        .is_some_and(TokenState::is_watched)
+                    if !self.subscriptions.is_owned_by(shard_id, &token_id)
+                        || !self
+                            .tokens
+                            .get(&token_id)
+                            .is_some_and(TokenState::is_watched)
                     {
                         return Ok(());
                     }
@@ -697,10 +861,11 @@ impl AgeRecorder {
                     let mut by_token = BTreeMap::<String, Vec<RawPriceChange>>::new();
 
                     for change in event.price_changes {
-                        if self
-                            .tokens
-                            .get(&change.asset_id)
-                            .is_some_and(TokenState::is_watched)
+                        if self.subscriptions.is_owned_by(shard_id, &change.asset_id)
+                            && self
+                                .tokens
+                                .get(&change.asset_id)
+                                .is_some_and(TokenState::is_watched)
                         {
                             self.register_market_token(&market, shard_id, &change.asset_id)?;
                             by_token
@@ -1088,6 +1253,7 @@ impl AgeRecorder {
         if !self.tokens.contains_key(token_id) {
             return Ok(false);
         }
+        self.subscription_budget_remaining.remove(token_id);
         self.ensure_memory(token_id)?;
 
         let Some(state) = self.tokens.remove(token_id) else {
