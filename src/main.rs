@@ -21,6 +21,10 @@ struct Args {
     /// HTTP API port.
     #[arg(long, default_value_t = 3001)]
     port: u16,
+
+    /// Resume every persisted watched token on startup.
+    #[arg(long)]
+    resume_watched: bool,
 }
 
 #[tokio::main]
@@ -47,7 +51,7 @@ async fn main() -> Result<()> {
         fees.seed(market);
     }
 
-    let runtime = recorder::start(store, fees).await?;
+    let runtime = recorder::start(store, fees, args.resume_watched).await?;
     let app = api::router(runtime.handle());
     let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
 
