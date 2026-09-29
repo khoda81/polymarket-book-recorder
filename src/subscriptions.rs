@@ -481,7 +481,12 @@ fn attribute_frame_bytes(frame_bytes: usize, events: &[MarketEvent]) -> Vec<(Str
                 token_ids.insert(event.asset_id.clone());
             }
             MarketEvent::PriceChange(event) => {
-                token_ids.extend(event.price_changes.iter().map(|change| change.asset_id.clone()));
+                token_ids.extend(
+                    event
+                        .price_changes
+                        .iter()
+                        .map(|change| change.asset_id.clone()),
+                );
             }
             MarketEvent::Watermark(event) => {
                 if let Some(token_id) = &event.asset_id {
@@ -576,9 +581,15 @@ mod tests {
         .unwrap();
 
         let attributed = attribute_frame_bytes(101, &events);
-        assert_eq!(attributed.iter().map(|(_, bytes)| bytes).sum::<usize>(), 101);
         assert_eq!(
-            attributed.iter().map(|(token_id, _)| token_id.as_str()).collect::<Vec<_>>(),
+            attributed.iter().map(|(_, bytes)| bytes).sum::<usize>(),
+            101
+        );
+        assert_eq!(
+            attributed
+                .iter()
+                .map(|(token_id, _)| token_id.as_str())
+                .collect::<Vec<_>>(),
             ["a", "b"]
         );
     }
