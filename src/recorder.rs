@@ -742,10 +742,11 @@ impl AgeRecorder {
             } => match event {
                 MarketEvent::Book(event) => {
                     let token_id = event.asset_id;
-                    if !self
-                        .tokens
-                        .get(&token_id)
-                        .is_some_and(TokenState::is_watched)
+                    if !self.subscriptions.is_owned_by(shard_id, &token_id)
+                        || !self
+                            .tokens
+                            .get(&token_id)
+                            .is_some_and(TokenState::is_watched)
                     {
                         return Ok(());
                     }
@@ -795,10 +796,11 @@ impl AgeRecorder {
                     let mut by_token = BTreeMap::<String, Vec<RawPriceChange>>::new();
 
                     for change in event.price_changes {
-                        if self
-                            .tokens
-                            .get(&change.asset_id)
-                            .is_some_and(TokenState::is_watched)
+                        if self.subscriptions.is_owned_by(shard_id, &change.asset_id)
+                            && self
+                                .tokens
+                                .get(&change.asset_id)
+                                .is_some_and(TokenState::is_watched)
                         {
                             self.register_market_token(&market, shard_id, &change.asset_id)?;
                             by_token
