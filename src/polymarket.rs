@@ -45,6 +45,8 @@ pub struct PriceChangeEvent {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketWatermarkEvent {
     pub market: String,
+    #[serde(default)]
+    pub asset_id: Option<String>,
     #[serde(
         default,
         rename = "timestamp",
@@ -188,7 +190,12 @@ mod tests {
         let array = format!(
             r#"[{book},{{"event_type":"last_trade_price","market":"0xabc","asset_id":"123","timestamp":"1001"}}]"#
         );
-        assert_eq!(parse_market_message(&array).unwrap().len(), 2);
+        let events = parse_market_message(&array).unwrap();
+        assert_eq!(events.len(), 2);
+        let MarketEvent::Watermark(watermark) = &events[1] else {
+            panic!("expected watermark");
+        };
+        assert_eq!(watermark.asset_id.as_deref(), Some("123"));
     }
 
     #[test]
