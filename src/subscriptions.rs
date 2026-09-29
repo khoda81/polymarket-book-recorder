@@ -106,6 +106,10 @@ impl SubscriptionPool {
         self.owner_by_token.contains_key(token_id)
     }
 
+    pub fn is_owned_by(&self, shard_id: u64, token_id: &str) -> bool {
+        self.owner_by_token.get(token_id) == Some(&shard_id)
+    }
+
     pub async fn add(&mut self, token_ids: impl IntoIterator<Item = String>) {
         let mut pending = token_ids
             .into_iter()
@@ -592,6 +596,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a", "b"]
         );
+    }
+
+    #[test]
+    fn ownership_is_shard_specific() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let mut pool = SubscriptionPool::with_url("ws://invalid", event_tx);
+        pool.owner_by_token.insert("token".into(), 7);
+
+        assert!(pool.is_assigned("token"));
+        assert!(pool.is_owned_by(7, "token"));
+        assert!(!pool.is_owned_by(8, "token"));
+        assert!(!pool.is_owned_by(7, "other"));
     }
 
     #[test]
