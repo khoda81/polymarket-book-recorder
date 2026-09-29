@@ -45,6 +45,22 @@ pub struct RecorderStateResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TokenTraffic {
+    pub token_id: String,
+    pub bytes: u64,
+    pub active: bool,
+    pub budget_remaining_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecorderTraffic {
+    pub total_bytes: u64,
+    pub tokens: Vec<TokenTraffic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecorderStats {
     pub watched_tokens: usize,
     pub completed_tokens: usize,
@@ -240,6 +256,10 @@ enum RecorderCommand {
     Stats {
         reply: oneshot::Sender<std::result::Result<RecorderStats, String>>,
     },
+    Traffic {
+        limit: usize,
+        reply: oneshot::Sender<RecorderTraffic>,
+    },
     Stop {
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
@@ -293,6 +313,15 @@ impl RecorderHandle {
             .await
             .map_err(|_| anyhow!("recorder stopped"))?
             .map_err(anyhow::Error::msg)
+    }
+
+    pub async fn traffic(&self, limit: usize) -> Result<RecorderTraffic> {
+        let (reply, response) = oneshot::channel();
+        self.command_tx
+            .send(RecorderCommand::Traffic { limit, reply })
+            .await
+            .map_err(|_| anyhow!("recorder stopped"))?;
+        response.await.map_err(|_| anyhow!("recorder stopped"))
     }
 }
 
@@ -390,6 +419,7 @@ struct AgeRecorder {
     markets: HashMap<(String, u64), MarketState>,
     dirty: BTreeSet<String>,
     subscription_budget_remaining: HashMap<String, usize>,
+    subscription_ingress_by_token: HashMap<String, u64>,
     subscription_ingress_bytes: u64,
     budget_exhausted_tokens: u64,
     command_rx: mpsc::Receiver<RecorderCommand>,
@@ -412,6 +442,7 @@ impl AgeRecorder {
             markets: HashMap::new(),
             dirty: BTreeSet::new(),
             subscription_budget_remaining: HashMap::new(),
+            subscription_ingress_by_token: HashMap::new(),
             subscription_ingress_bytes: 0,
             budget_exhausted_tokens: 0,
             command_rx,
@@ -476,6 +507,9 @@ impl AgeRecorder {
             }
             RecorderCommand::Stats { reply } => {
                 let _ = reply.send(self.stats().map_err(|error| error.to_string()));
+            }
+            RecorderCommand::Traffic { limit, reply } => {
+                let _ = reply.send(self.traffic(limit));
             }
             RecorderCommand::Stop { reply } => {
                 let result = self.shutdown().await;
@@ -674,19 +708,53 @@ impl AgeRecorder {
         })
     }
 
+    fn traffic(&self, limit: usize) -> RecorderTraffic {
+        let mut tokens = self
+            .subscription_ingress_by_token
+            .iter()
+            .map(|(token_id, &bytes)| TokenTraffic {
+                token_id: token_id.clone(),
+                bytes,
+                active: self.subscriptions.is_assigned(token_id),
+                budget_remaining_bytes: self
+                    .subscription_budget_remaining
+                    .get(token_id)
+                    .copied(),
+            })
+            .collect::<Vec<_>>();
+        tokens.sort_unstable_by(|left, right| {
+            right
+                .bytes
+                .cmp(&left.bytes)
+                .then_with(|| left.token_id.cmp(&right.token_id))
+        });
+        tokens.truncate(limit);
+
+        RecorderTraffic {
+            total_bytes: self.subscription_ingress_bytes,
+            tokens,
+        }
+    }
+
     async fn consume_subscription_event(&mut self, event: SubscriptionEvent) -> Result<()> {
         match event {
             SubscriptionEvent::Ingress { bytes_by_token } => {
                 let mut exhausted = Vec::new();
 
                 for (token_id, bytes) in bytes_by_token {
+                    let bytes = bytes as u64;
                     self.subscription_ingress_bytes =
-                        self.subscription_ingress_bytes.saturating_add(bytes as u64);
+                        self.subscription_ingress_bytes.saturating_add(bytes);
+                    let token_bytes = self
+                        .subscription_ingress_by_token
+                        .entry(token_id.clone())
+                        .or_default();
+                    *token_bytes = token_bytes.saturating_add(bytes);
 
                     let exhausted_now = if let Some(remaining) =
                         self.subscription_budget_remaining.get_mut(&token_id)
                     {
-                        *remaining = remaining.saturating_sub(bytes);
+                        *remaining = remaining.saturating_sub(bytes as usize);
                         *remaining == 0
                     } else {
                         false
