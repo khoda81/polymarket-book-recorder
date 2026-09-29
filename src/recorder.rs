@@ -716,10 +716,7 @@ impl AgeRecorder {
                 token_id: token_id.clone(),
                 bytes,
                 active: self.subscriptions.is_assigned(token_id),
-                budget_remaining_bytes: self
-                    .subscription_budget_remaining
-                    .get(token_id)
-                    .copied(),
+                budget_remaining_bytes: self.subscription_budget_remaining.get(token_id).copied(),
             })
             .collect::<Vec<_>>();
         tokens.sort_unstable_by(|left, right| {
