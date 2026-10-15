@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{net::IpAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
@@ -17,6 +17,10 @@ struct Args {
     /// SQLite recorder database.
     #[arg(long, default_value = ".data/rust-recorder.sqlite")]
     database: PathBuf,
+
+    /// HTTP API bind address. Use 127.0.0.1 behind a reverse proxy.
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: IpAddr,
 
     /// HTTP API port.
     #[arg(long, default_value_t = 3001)]
@@ -53,9 +57,9 @@ async fn main() -> Result<()> {
 
     let runtime = recorder::start(store, fees, args.resume_watched).await?;
     let app = api::router(runtime.handle());
-    let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
+    let listener = TcpListener::bind((args.bind, args.port)).await?;
 
-    info!(port = args.port, database = %args.database.display(), "age recorder listening");
+    info!(bind = %args.bind, port = args.port, database = %args.database.display(), "age recorder listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
