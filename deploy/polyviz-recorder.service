@@ -1,0 +1,28 @@
+[Unit]
+Description=Polymarket book recorder
+Wants=network-online.target
+After=network-online.target
+# Nothing to run until the first release has been deployed.
+ConditionPathExists=/opt/polyviz/recorder/current/polymarket-book-recorder
+
+[Service]
+User=polyviz
+Group=polyviz
+StateDirectory=polyviz
+WorkingDirectory=/var/lib/polyviz
+ExecStart=/opt/polyviz/recorder/current/polymarket-book-recorder --bind 127.0.0.1 --port 3001 --database /var/lib/polyviz/recorder.sqlite
+Environment=RUST_LOG=polymarket_book_recorder=info
+Restart=always
+RestartSec=5
+# SIGTERM triggers the recorder's final flush; give it time to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

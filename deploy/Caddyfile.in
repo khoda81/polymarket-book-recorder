@@ -1,0 +1,22 @@
+# Rendered by bootstrap.sh into /etc/caddy/Caddyfile.
+@DOMAIN@ {
+	basic_auth {
+		@LOGIN@ @PASSWORD_HASH@
+	}
+	encode zstd gzip
+
+	handle /api/recorder/* {
+		reverse_proxy 127.0.0.1:3001
+	}
+
+	handle {
+		root * /opt/polyviz/frontend/current
+		# Vite fingerprints everything under /assets; the HTML entry must revalidate.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@entry not path /assets/*
+		header @entry Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}

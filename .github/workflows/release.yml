@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
+  ASSET: polymarket-book-recorder-${{ github.event.release.tag_name }}-x86_64-linux.tar.gz
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Building on Debian 12 keeps the glibc floor at 2.36, so the binary runs
+    # on Debian 12+ and Ubuntu 24.04+ hosts.
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          tar -czf "$ASSET" -C target/release polymarket-book-recorder
+          sha256sum "$ASSET" > "$ASSET.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: ${{ env.ASSET }}*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+      - run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  deploy:
+    needs: publish
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-recorder
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ]; then
+            echo "::notice::DEPLOY_HOST is not configured; release published without deploying."
+            exit 0
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519
+          # TAG is meant to expand here, on the runner.
+          # shellcheck disable=SC2029
+          ssh "polyviz-deploy@$DEPLOY_HOST" recorder "$TAG"

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Installs a published GitHub release of the recorder or the frontend and
+# switches the live symlink to it.
+#
+#   polyviz-deploy <recorder|frontend> <tag>
+#
+# The CI deploy key is pinned to this script in authorized_keys, so over SSH
+# the arguments arrive in SSH_ORIGINAL_COMMAND rather than argv. Run it as
+# polyviz-deploy, e.g. `sudo -u polyviz-deploy polyviz-deploy recorder v0.1.0`
+# to roll back by hand.
+set -euo pipefail
+
+readonly owner=khoda81
+readonly keep_releases=5
+readonly health_url=http://127.0.0.1:3001/api/recorder/health
+readonly health_timeout_s=120
+
+usage() {
+  echo "usage: polyviz-deploy <recorder|frontend> <tag>" >&2
+  exit 2
+}
+
+if [[ -n ${SSH_ORIGINAL_COMMAND:-} ]]; then
+  read -r -a args <<<"$SSH_ORIGINAL_COMMAND"
+else
+  args=("$@")
+fi
+[[ ${#args[@]} -eq 2 ]] || usage
+component=${args[0]}
+tag=${args[1]}
+[[ $tag =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "invalid tag: $tag" >&2; exit 2; }
+
+case $component in
+  recorder)
+    repo=polymarket-book-recorder
+    asset=polymarket-book-recorder-$tag-x86_64-linux.tar.gz
+    ;;
+  frontend)
+    repo=polymarket-book-vis
+    asset=polymarket-book-vis-$tag-dist.tar.gz
+    ;;
+  *) usage ;;
+esac
+
+root=/opt/polyviz/$component
+release=releases/$tag
+
+# Atomically repoints $root/current at a path relative to $root.
+switch_to() {
+  ln -sfn "$1" "$root/.current.new"
+  mv -T "$root/.current.new" "$root/current"
+}
+
+restart_recorder() {
+  sudo -n systemctl restart polyviz-recorder.service
+  local deadline=$((SECONDS + health_timeout_s))
+  until curl -fs -o /dev/null "$health_url"; do
+    if ((SECONDS >= deadline)); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+if [[ ! -d $root/$release ]]; then
+  # Stage beside the release directory so the final mv is a same-filesystem rename.
+  work=$(mktemp -d "$root/.incoming.XXXXXX")
+  trap 'rm -rf -- "$work"' EXIT
+  base=https://github.com/$owner/$repo/releases/download/$tag
+  curl -fsSL --retry 3 -o "$work/$asset" "$base/$asset"
+  curl -fsSL --retry 3 -o "$work/$asset.sha256" "$base/$asset.sha256"
+  (cd "$work" && sha256sum --check --strict --quiet "$asset.sha256")
+  mkdir "$work/unpacked"
+  tar -xzf "$work/$asset" -C "$work/unpacked" --no-same-owner
+  # The recorder service and Caddy run as other users.
+  chmod -R a+rX "$work/unpacked"
+  mv -T "$work/unpacked" "$root/$release"
+fi
+touch "$root/$release"
+
+previous=$(readlink "$root/current" || true)
+switch_to "$release"
+
+if [[ $component == recorder ]] && ! restart_recorder; then
+  echo "recorder $tag failed its health check" >&2
+  if [[ -n $previous && $previous != "$release" ]]; then
+    echo "rolling back to $previous" >&2
+    switch_to "$previous"
+    restart_recorder || echo "rollback is unhealthy too; see journalctl -u polyviz-recorder" >&2
+  fi
+  exit 1
+fi
+
+# Keep the newest releases, plus whatever was live before this deploy.
+# Release names are validated tags, so ls output is safe to split.
+# shellcheck disable=SC2012
+mapfile -t stale < <(ls -1t "$root/releases" | tail -n +$((keep_releases + 1)))
+for name in "${stale[@]}"; do
+  [[ releases/$name == "$release" || releases/$name == "$previous" ]] && continue
+  rm -rf -- "${root:?}/releases/$name"
+done
+
+echo "deployed $component $tag"
