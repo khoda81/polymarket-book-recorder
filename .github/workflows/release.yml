@@ -9,11 +9,12 @@ permissions:
 
 env:
   TAG: ${{ github.event.release.tag_name }}
-  ASSET: polymarket-book-recorder-${{ github.event.release.tag_name }}-x86_64-linux.tar.gz
+  ASSET: polymarket-book-recorder-${{ github.event.release.tag_name }}-aarch64-linux.tar.gz
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # The VPS is arm64, so releases are built natively on an arm64 runner.
+    runs-on: ubuntu-24.04-arm
     # Building on Debian 12 keeps the glibc floor at 2.36, so the binary runs
     # on Debian 12+ and Ubuntu 24.04+ hosts.
     container: rust:1-bookworm

@@ -23,9 +23,10 @@ Prereleases are built and attached but not deployed.
 
 ## One-time setup
 
-1. Create a Debian 12+ or Ubuntu 24.04+ x86_64 VPS. Point a DNS A record at
-   it. If the DNS is on Cloudflare, leave the record unproxied, because CI
-   reaches the host over SSH by that name.
+1. Create a Debian 12+ or Ubuntu 24.04+ arm64 VPS; recorder releases are
+   built only for aarch64. Point a DNS A record at it. If the DNS is on
+   Cloudflare, leave the record unproxied, because CI reaches the host over
+   SSH by that name.
 2. Generate the deploy key locally:
 
        ssh-keygen -t ed25519 -N '' -C polyviz-deploy -f polyviz-deploy

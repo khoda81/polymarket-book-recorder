@@ -33,7 +33,7 @@ tag=${args[1]}
 case $component in
   recorder)
     repo=polymarket-book-recorder
-    asset=polymarket-book-recorder-$tag-x86_64-linux.tar.gz
+    asset=polymarket-book-recorder-$tag-$(uname -m)-linux.tar.gz
     ;;
   frontend)
     repo=polymarket-book-vis
