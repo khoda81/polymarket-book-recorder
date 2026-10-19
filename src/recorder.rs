@@ -28,7 +28,7 @@ use crate::{
 const PERSIST_DEBOUNCE: Duration = Duration::from_secs(1);
 const EVENT_CHANNEL_CAPACITY: usize = 16_384;
 const COMMAND_CHANNEL_CAPACITY: usize = 128;
-const TOKEN_INGRESS_BUDGET_BYTES: usize = 1024 * 1024;
+const TOKEN_INGRESS_BUDGET_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TransportState {

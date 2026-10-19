@@ -11,7 +11,7 @@ Older database schemas are rejected.
   reconnect, and continuity invalidation
 - persisted watched tokens stay dormant after restart by default; use
   `--resume-watched` to resume all of them explicitly
-- each requested token gets a 1 MiB upstream WebSocket payload lease; another
+- each requested token gets a 10 MiB upstream WebSocket payload lease; another
   state/watch request refreshes it, while exhaustion unsubscribes the token
   without deleting its persisted history
 - WebSocket-only causal book bootstrap; REST snapshots are never merged into
