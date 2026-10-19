@@ -10,16 +10,15 @@ browser ─HTTPS─> Caddy :443 (basic auth)
                   └─ /*               → /opt/polyviz/frontend/current
 ```
 
-Publishing a GitHub release in either repository runs its `Release` workflow.
-The workflow builds the release, attaches a tarball and its `.sha256` to the
-release, and then SSHes to the VPS. The deploy key can only run
+Every push to `main` in either repository runs its `Release` workflow. The
+workflow builds the commit, publishes it as a GitHub release tagged
+`vYYYY.MM.DD-<short sha>` with a tarball and its `.sha256`, and then SSHes to
+the VPS. The deploy key can only run
 `polyviz-deploy <component> <tag>`, which downloads and verifies the release
 asset, unpacks it under `/opt/polyviz/<component>/releases/<tag>`, and
 atomically repoints `current`. A recorder deploy restarts the service and rolls
 back to the previous release if `/api/recorder/health` does not answer within
 two minutes. The newest five releases are kept.
-
-Prereleases are built and attached but not deployed.
 
 ## One-time setup
 
@@ -41,7 +40,7 @@ Prereleases are built and attached but not deployed.
    - variable `DEPLOY_KNOWN_HOSTS`: the output of `ssh-keyscan -t ed25519 <domain>`
    - secret `DEPLOY_SSH_KEY`: the contents of `polyviz-deploy` (the private key)
 
-   Until `DEPLOY_HOST` is set, releases are built and attached without deploying.
+   Until `DEPLOY_HOST` is set, releases are published without deploying.
 
 5. Optional: bring over existing history before the first recorder deploy:
 
@@ -53,13 +52,15 @@ Prereleases are built and attached but not deployed.
 
 ## Releasing
 
-    gh release create v0.1.0 --generate-notes
+Merge to `main`. The two repositories deploy independently; the protobuf
+schema keeps an older frontend and a newer recorder (or the reverse)
+compatible, so they need not be released together.
 
 ## Operating
 
     journalctl -u polyviz-recorder -f                           # recorder logs
-    sudo -u polyviz-deploy polyviz-deploy recorder v0.0.9       # roll back by hand
+    sudo -u polyviz-deploy polyviz-deploy recorder <older tag>  # roll back by hand
     curl -s 127.0.0.1:3001/api/recorder/health                  # on the VPS
 
-You can also re-run the `deploy` job of an older release in GitHub Actions to
-roll back.
+You can also re-run the `deploy` job of an older `Release` run in GitHub
+Actions to roll back.

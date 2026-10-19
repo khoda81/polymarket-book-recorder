@@ -1,15 +1,12 @@
 name: Release
 
+# Every push to main is released and deployed.
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
 
 permissions:
   contents: write
-
-env:
-  TAG: ${{ github.event.release.tag_name }}
-  ASSET: polymarket-book-recorder-${{ github.event.release.tag_name }}-aarch64-linux.tar.gz
 
 jobs:
   build:
@@ -18,18 +15,31 @@ jobs:
     # Building on Debian 12 keeps the glibc floor at 2.36, so the binary runs
     # on Debian 12+ and Ubuntu 24.04+ hosts.
     container: rust:1-bookworm
+    outputs:
+      tag: ${{ steps.name.outputs.tag }}
+      asset: ${{ steps.name.outputs.asset }}
     steps:
       - uses: actions/checkout@v4
+      # Derived from the commit rather than the clock, so a re-run reuses the tag.
+      - id: name
+        env:
+          COMMITTED_AT: ${{ github.event.head_commit.timestamp }}
+        run: |
+          tag="v$(date -u -d "$COMMITTED_AT" +%Y.%m.%d)-${GITHUB_SHA::7}"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "asset=polymarket-book-recorder-$tag-aarch64-linux.tar.gz" >>"$GITHUB_OUTPUT"
       - run: cargo test --locked
       - run: cargo build --release --locked
       - name: Package
+        env:
+          ASSET: ${{ steps.name.outputs.asset }}
         run: |
           tar -czf "$ASSET" -C target/release polymarket-book-recorder
           sha256sum "$ASSET" > "$ASSET.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: release
-          path: ${{ env.ASSET }}*
+          path: ${{ steps.name.outputs.asset }}*
 
   publish:
     needs: build
@@ -38,13 +48,20 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release
-      - run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber --repo "$GITHUB_REPOSITORY"
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ASSET: ${{ needs.build.outputs.asset }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "$ASSET" "$ASSET.sha256" --target "$GITHUB_SHA" \
+              --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi
 
   deploy:
-    needs: publish
-    if: ${{ !github.event.release.prerelease }}
+    needs: [build, publish]
     runs-on: ubuntu-latest
     environment: production
     concurrency:
@@ -53,6 +70,7 @@ jobs:
     steps:
       - name: Deploy over SSH
         env:
+          TAG: ${{ needs.build.outputs.tag }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
