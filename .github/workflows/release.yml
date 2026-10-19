@@ -15,6 +15,10 @@ jobs:
     # Building on Debian 12 keeps the glibc floor at 2.36, so the binary runs
     # on Debian 12+ and Ubuntu 24.04+ hosts.
     container: rust:1-bookworm
+    # Container steps default to sh.
+    defaults:
+      run:
+        shell: bash
     outputs:
       tag: ${{ steps.name.outputs.tag }}
       asset: ${{ steps.name.outputs.asset }}
